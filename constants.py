@@ -18,6 +18,13 @@ def _mk1_vel(red: int, green: int) -> int:
 # MK1 OFF constant (red=0, green=0):
 MK1_OFF = _mk1_vel(0, 0)   # 12
 
+# VESTIGIAL: the hand-tuned per-index → red/green table below is no longer used
+# by the LED path.  led_display._mk1_velocity now resolves a palette index by
+# looking up its MK3 (LP3) RGB and running it through the shared blue-fold +
+# saturation/gamma pipeline, so indexed and RGB pads stay consistent on MK1.
+# Kept for reference / possible reuse; LedColor's explicit mk1= override remains
+# the supported way to force a specific first-gen colour at the page level.
+#
 # Named mappings for the palette indices actually used by this script.
 # Any index not listed here maps to MK1_OFF via MK1_VELOCITY_TABLE below.
 #
@@ -70,6 +77,90 @@ def _build_mk1_velocity_table() -> tuple:
 
 MK1_VELOCITY_TABLE: tuple = _build_mk1_velocity_table()
 
+def mk1_velocity_from_rg(two_digit: int) -> int:
+    """MK1 velocity from a two-digit RG value (tens=red 0-3, ones=green 0-3).
+
+    e.g. 30 -> full red, 3 -> full green, 33 -> full amber, 0 -> off.
+    """
+    return _mk1_vel((two_digit // 10) % 10, two_digit % 10)
+
+# Page-level LED colour.
+#
+# Every mode's lighting function returns one of these.  A pad/CC's appearance is
+# decided where the colour is *chosen* (the page), not by a global per-index
+# lookup, so the same palette index can carry a different first-gen brightness
+# in different contexts, and an RGB pad can still name a deliberate MK1 colour.
+#
+#   index : palette index for MK2 / LP3 families (and the MK1 reverse-map
+#           fallback when no explicit mk1 is given)
+#   rgb   : explicit native-RGB triple for MK2 / LP3; None means use *index*
+#   mk1   : explicit first-gen red/green as a two-digit decimal (tens=red 0-3,
+#           ones=green 0-3, e.g. 30 = full red).  None means fall back to
+#           folding *rgb* down (if present) or reverse-mapping *index*.
+#
+# It is a tuple subclass, so it stays hashable for the LED caches and the old
+# (index, rgb) shape is still reachable as lc[0], lc[1].
+from typing import NamedTuple
+
+class LedColor(NamedTuple):
+    index: int
+    rgb: tuple = None
+    mk1: int = None
+
+    @staticmethod
+    def of(index: int, rgb=None, mk1: int = None) -> "LedColor":
+        return LedColor(index, rgb, mk1)
+
+# Shared off/disabled colour (palette 0, MK1 off).
+LED_OFF = LedColor(0x00, None, 0)
+
+def mk1_fold_blue(red: int, green: int, blue: int) -> tuple[int, int, int]:
+    """Fold a colour's blue component into red/green for MK1's 2-element LEDs.
+
+    Half of blue is split equally into red and green (so cyan/magenta/blue
+    still light up rather than collapsing to nothing), then the result is
+    rescaled so the brightest output channel matches the original colour's
+    brightest channel — e.g. a fully-saturated blue becomes full-brightness
+    amber, and a 75%-bright white becomes a 75%-bright amber, rather than
+    being halved by the fold. Done in raw colour space, before
+    saturation/gamma tuning, so that tuning can re-punch-up whatever the fold
+    dulled.
+    """
+    value = max(red, green, blue)
+    folded_red = red + blue // 4
+    folded_green = green + blue // 4
+    folded_max = max(folded_red, folded_green)
+    if folded_max > 0:
+        folded_red = folded_red * value // folded_max
+        folded_green = folded_green * value // folded_max
+    return (folded_red, folded_green, 0)
+
+def mk1_velocity_from_rgb(red: int, green: int, maximum: int = 63) -> int:
+    """Quantize a tuned 0-maximum (red, green) pair to a MK1 velocity.
+
+    Expects blue already folded into red/green (see mk1_fold_blue) and
+    saturation/gamma already applied. Each channel is rounded to the
+    hardware's 4 brightness levels (0-3).
+    """
+    maximum = max(1, int(maximum))
+    red_level = min(3, (red * 3 + maximum // 2) // maximum)
+    green_level = min(3, (green * 3 + maximum // 2) // maximum)
+    return _mk1_vel(red_level, green_level)
+
+# MK1-protocol grid note mapping (original Launchpad / Launchpad S / Mini MK1).
+#
+# Internal pad IDs everywhere else in this script use the MK2-style scheme
+# row*10+col (row/col 1-8, side column at col 9). The MK1-protocol X-Y layout
+# instead numbers the 8x8 grid as note = (row-1)*16 + (col-1), with the
+# right-hand scene-launch column (side column) at note = (row-1)*16 + 8.
+def pad_to_mk1_note(pad: int) -> int:
+    row, col = divmod(pad, 10)
+    return (8 - row) * 16 + (col - 1)
+
+def mk1_note_to_pad(note: int) -> int:
+    row, col = divmod(note, 16)
+    return (8 - row) * 10 + (col + 1)
+
 # SysEx / layout IDs
 LAYOUT_SESSION = 0x00
 LAYOUT_USER_2  = 0x02
@@ -93,6 +184,14 @@ TOP_RECORD_ARM  = 111
 # MIDI routing
 SESSION_CHANNEL          = 0
 USER2_FALLBACK_CHANNELS  = (13, 14, 15)
+# MK1-protocol "set duty cycle" (brightness) command, sent once on init.
+# Brightness = numerator / denominator; hardware default is 1/5.
+# Valid range per the Launchpad S PRM: numerator 1-18, denominator 3-18.
+# Only values SMALLER than 1/2 seem accepted by the Launchpad S. However
+# 1/11 and smaller are declared "absolutely revolting" by Novation 
+# due to flickering issues.
+MK1_DUTY_CYCLE_NUMERATOR   = 1
+MK1_DUTY_CYCLE_DENOMINATOR = 5
 # XY pad generated CCs. 102/103 are in the undefined high CC range, avoiding
 # common controls like mod wheel, volume, pan, expression, and sustain.
 XY_PAD_X_CC = 102
@@ -151,8 +250,10 @@ LB_STATUS_FILLED        = 1
 TLC_MUTE_OTHERS         = 1
 TLC_FILL                = 2
 # FPC colour tuning
-# Keep separate values for MK2 and LP3-generation devices. The LEDs differ
+# Keep separate values for MK1, MK2 and LP3-generation devices. The LEDs differ
 # enough that one set of numbers is not a good universal fit.
+FPC_COLOR_SATURATION_MK1 = 1.5
+FPC_COLOR_GAMMA_MK1      = 1.5
 FPC_COLOR_SATURATION_MK2 = 1.25
 FPC_COLOR_GAMMA_MK2      = 0.5
 FPC_COLOR_SATURATION_LP3 = 1.25
@@ -357,19 +458,21 @@ DEFAULT_STATE = {
 
 # Settings-screen pad maps
 OVERLAP_SETTING_PADS = {
-    81: 8,  # sequential
-    82: 2,
-    83: 3,
-    84: 4,
-    85: 5,
+    71: 2,
+    72: 3,
+    73: 4,
+    74: 5,
+    75: 6,
+    76: 7,
+    77: 8,
+    78: 9,
 }
 AXIS_SETTING_PAD     = 87
 CHROMATIC_SETTING_PAD = 88
 INACTIVE_SETTINGS_PADS = {
-    86,
-    71, 72, 73, 74, 75, 76, 77, 78,
     61, 64, 68,
     58,
+    81, 82, 83, 84, 85, 86,
 }
 ROOT_SETTING_PADS = {
     62: 1,  63: 3,  65: 6,  66: 8,  67: 10,
@@ -387,8 +490,10 @@ MIDI_CHANNEL_SETTING_PADS = {
 
 # Palette RGB tables
 # MK2: 64-step (0-63 per channel) palette from factory dump.
+# NOTE: the raw factory dump had a spurious leading entry (122, 186, 250) that
+# shifted every real colour down by one index; it has been dropped so palette
+# index N now maps to the colour the hardware shows for N.
 MK2_PALETTE_RGB = (
-    (122, 186, 250),
     (0, 0, 0),
     (16, 16, 16),
     (32, 32, 32),
@@ -516,6 +621,7 @@ MK2_PALETTE_RGB = (
     (45, 43, 0),
     (15, 12, 0),
     (44, 20, 0),
+    (18, 5, 0),
 )
 
 # LP3: 128-step (0-255 per channel) palette shared by LPX and Mini MK3.
@@ -524,130 +630,130 @@ LP3_PALETTE_RGB = (
     (63, 63, 63),
     (127, 127, 127),
     (255, 255, 255),
-    (63, 63, 255),
-    (0, 0, 255),
-    (0, 0, 127),
-    (0, 0, 63),
-    (111, 191, 255),
-    (0, 63, 255),
-    (0, 31, 127),
-    (0, 15, 63),
-    (47, 175, 255),
-    (0, 255, 255),
-    (0, 127, 127),
-    (0, 63, 63),
-    (47, 255, 127),
-    (0, 255, 79),
-    (0, 127, 47),
-    (0, 63, 23),
-    (63, 255, 79),
+    (255, 63, 63),
+    (255, 0, 0),
+    (127, 0, 0),
+    (63, 0, 0),
+    (255, 191, 111),
+    (255, 63, 0),
+    (127, 31, 0),
+    (63, 15, 0),
+    (255, 175, 47),
+    (255, 255, 0),
+    (127, 127, 0),
+    (63, 63, 0),
+    (127, 255, 47),
+    (79, 255, 0),
+    (47, 127, 0),
+    (23, 63, 0),
+    (79, 255, 63),
     (0, 255, 0),
     (0, 127, 0),
     (0, 63, 0),
     (79, 255, 79),
-    (31, 255, 0),
-    (15, 127, 0),
-    (7, 63, 0),
-    (95, 255, 79),
-    (95, 255, 0),
-    (47, 127, 0),
-    (23, 63, 0),
-    (191, 255, 79),
-    (159, 255, 0),
-    (79, 127, 0),
-    (39, 63, 0),
-    (255, 191, 79),
-    (255, 175, 0),
-    (127, 87, 0),
-    (63, 47, 0),
-    (255, 127, 79),
-    (255, 87, 0),
-    (127, 47, 0),
-    (63, 23, 0),
-    (255, 31, 47),
-    (255, 0, 0),
-    (127, 0, 0),
-    (63, 0, 0),
-    (255, 63, 95),
-    (255, 0, 47),
-    (127, 0, 23),
-    (63, 0, 15),
+    (0, 255, 31),
+    (0, 127, 15),
+    (0, 63, 7),
+    (79, 255, 95),
+    (0, 255, 95),
+    (0, 127, 47),
+    (0, 63, 23),
+    (79, 255, 191),
+    (0, 255, 159),
+    (0, 127, 79),
+    (0, 63, 39),
+    (79, 191, 255),
+    (0, 175, 255),
+    (0, 87, 127),
+    (0, 47, 63),
+    (79, 127, 255),
+    (0, 87, 255),
+    (0, 47, 127),
+    (0, 23, 63),
+    (47, 31, 255),
+    (0, 0, 255),
+    (0, 0, 127),
+    (0, 0, 63),
+    (95, 63, 255),
+    (47, 0, 255),
+    (23, 0, 127),
+    (15, 0, 63),
     (255, 63, 255),
     (255, 0, 255),
     (127, 0, 127),
     (63, 0, 63),
-    (111, 63, 255),
-    (79, 0, 255),
-    (47, 0, 127),
-    (31, 0, 63),
-    (0, 15, 255),
-    (0, 63, 159),
-    (0, 79, 127),
-    (0, 47, 47),
+    (255, 63, 111),
+    (255, 0, 79),
+    (127, 0, 47),
+    (63, 0, 31),
+    (255, 15, 0),
+    (159, 63, 0),
+    (127, 79, 0),
+    (47, 47, 0),
     (0, 63, 0),
-    (31, 63, 0),
-    (111, 31, 0),
-    (255, 0, 0),
-    (63, 63, 0),
-    (191, 0, 31),
-    (79, 63, 95),
-    (23, 15, 31),
+    (0, 63, 31),
+    (0, 31, 111),
     (0, 0, 255),
-    (47, 255, 191),
-    (0, 239, 175),
-    (0, 255, 95),
-    (0, 127, 15),
+    (0, 63, 63),
+    (31, 0, 191),
+    (95, 63, 79),
+    (31, 15, 23),
+    (255, 0, 0),
+    (191, 255, 47),
+    (175, 239, 0),
     (95, 255, 0),
-    (255, 159, 0),
-    (255, 47, 0),
-    (255, 0, 31),
-    (239, 0, 95),
-    (127, 31, 175),
-    (0, 15, 47),
+    (15, 127, 0),
+    (0, 255, 95),
+    (0, 159, 255),
     (0, 47, 255),
-    (0, 223, 127),
-    (31, 255, 111),
+    (31, 0, 255),
+    (95, 0, 239),
+    (175, 31, 127),
+    (47, 15, 0),
+    (255, 47, 0),
+    (127, 223, 0),
+    (111, 255, 31),
     (0, 255, 0),
-    (47, 255, 63),
-    (111, 239, 95),
-    (207, 255, 63),
-    (255, 143, 95),
-    (207, 79, 47),
-    (223, 79, 111),
-    (255, 31, 223),
-    (95, 0, 255),
-    (0, 79, 255),
-    (0, 175, 191),
-    (0, 255, 143),
-    (0, 95, 127),
-    (0, 47, 63),
-    (15, 71, 0),
-    (31, 79, 15),
-    (47, 23, 23),
-    (95, 31, 23),
-    (23, 55, 95),
-    (0, 0, 127),
-    (47, 63, 223),
-    (15, 71, 223),
-    (31, 191, 255),
-    (47, 223, 159),
-    (15, 175, 111),
-    (47, 23, 23),
-    (111, 223, 223),
-    (143, 239, 127),
-    (255, 159, 159),
-    (255, 111, 143),
+    (63, 255, 47),
+    (95, 239, 111),
+    (63, 255, 207),
+    (95, 143, 255),
+    (47, 79, 207),
+    (111, 79, 223),
+    (223, 31, 255),
+    (255, 0, 95),
+    (255, 79, 0),
+    (191, 175, 0),
+    (143, 255, 0),
+    (127, 95, 0),
+    (63, 47, 0),
+    (0, 71, 15),
+    (15, 79, 31),
+    (23, 23, 47),
+    (23, 31, 95),
+    (95, 55, 23),
+    (127, 0, 0),
+    (223, 63, 47),
+    (223, 71, 15),
+    (255, 191, 31),
+    (159, 223, 47),
+    (111, 175, 15),
+    (23, 23, 47),
+    (223, 223, 111),
+    (127, 239, 143),
+    (159, 159, 255),
+    (143, 111, 255),
     (63, 63, 63),
     (111, 111, 111),
-    (255, 255, 223),
-    (0, 0, 159),
-    (0, 0, 55),
-    (0, 207, 23),
+    (223, 255, 255),
+    (159, 0, 0),
+    (55, 0, 0),
+    (23, 207, 0),
     (0, 63, 0),
-    (0, 175, 191),
-    (0, 47, 63),
-    (0, 79, 175),
-    (0, 15, 79),
+    (191, 175, 0),
+    (63, 47, 0),
+    (175, 79, 0),
+    (79, 15, 0),
 )
 
 PALETTE_RGB_BY_FAMILY: dict[str, tuple] = {

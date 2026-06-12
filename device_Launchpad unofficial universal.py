@@ -66,6 +66,8 @@ from constants import (
     # modes
     MODE_NOTE, MODE_FPC, MODE_PERFORMANCE, MODE_CUSTOM,
     MODE_XY_PAD, MODE_STEP_SEQ, MODE_BLANK,
+    # MIDI routing
+    SESSION_CHANNEL,
     # timing
     TAP_AND_HOLD_DURATION_SECONDS,
     NOTE_DOUBLE_TAP_SECONDS,
@@ -77,6 +79,10 @@ from constants import (
     PLUGIN_PAD_OVERRIDE_GROSS_BEAT,
     # color constants needed for plugin-override lighting
     PAD_ACTION, PAD_DISABLED,
+    FPC_COLOR_SATURATION_MK1,
+    FPC_COLOR_GAMMA_MK1,
+    MK1_DUTY_CYCLE_NUMERATOR,
+    MK1_DUTY_CYCLE_DENOMINATOR,
     FPC_COLOR_SATURATION_MK2,
     FPC_COLOR_GAMMA_MK2,
     FPC_COLOR_SATURATION_LP3,
@@ -101,6 +107,9 @@ from constants import (
     XY_FADER_ON_COLOR, XY_FADER_OFF_COLOR, performance_modwheel_COLOR,
     XY_PAGE_XY, XY_PAGE_VERT, XY_PAGE_HORIZ, XY_PAGE_COUNT,
     NOTE_LOCK_PULSE_RGB,
+    mk1_note_to_pad,
+    LedColor,
+    LED_OFF,
 )
 DEVICE_FAMILY_MK1 = "mk1"
 DEVICE_FAMILY_MK2 = "mk2"
@@ -177,7 +186,6 @@ _MK1_GEN_EXACT_NAMES = (
     "launchpad",
     "novation launchpad",
     "launchpad s",
-    "novation launchpad s",
 )
 
 def _detect_device_family(device_id: bytes, device_name: str = "") -> str:
@@ -345,8 +353,8 @@ class LaunchpadSurface:
         self._fpc_button_hold_fired: bool = False
         # LED caches
         self._refresh_needed   = True
-        self._grid_led_cache:  dict[int, tuple[int, tuple[int, int, int] | None]] = {}
-        self._top_led_cache:   dict[int, int] = {}
+        self._grid_led_cache:  dict[int, LedColor] = {}
+        self._top_led_cache:   dict[int, LedColor] = {}
         # MK2 software pulse: timestamp when lock was engaged (phase origin)
         self._pulse_start      = 0.0
         self._pulse_last_frame = 0.0
@@ -685,6 +693,10 @@ class LaunchpadSurface:
             self._launch_map_ready = pm.update_launch_map(self._launch_map_ready)
         self._refresh_needed = True
     def on_midi_in(self, event) -> None:
+        if self.device_family == DEVICE_FAMILY_MK1 and (event.status & 0xF0) in (
+            midi.MIDI_NOTEON, midi.MIDI_NOTEOFF
+        ):
+            event.data1 = mk1_note_to_pad(event.data1)
         if not self._should_filter_midi_in(event):
             return
         event.handled = True
@@ -1476,7 +1488,7 @@ class LaunchpadSurface:
         self._xy_fader_values[cc] = new_value
         self._process_xy_cc(event, cc, int(round(new_value)))
 
-    def _xy_lighting(self, pad: int) -> tuple[int, tuple[int, int, int] | None]:
+    def _xy_lighting(self, pad: int) -> LedColor:
         page = self._xy_page()
         # Side column: always the page selector in XY mode.
         slot = ps.pad_to_slot(pad)
@@ -1491,7 +1503,7 @@ class LaunchpadSurface:
             )
         cc = xp.grid_fader_cc(pad, page)
         if cc is None:
-            return PAD_DISABLED, None
+            return LedColor(PAD_DISABLED)
         return self._fader_pad_lighting(
             self._xy_faders[cc],
             XY_FADER_ON_COLOR,
@@ -1507,19 +1519,25 @@ class LaunchpadSurface:
         off_color: int,
         pad: int,
         current_value: float,
-    ) -> tuple[int, tuple[int, int, int] | None]:
-        """Generic firmware-style fader pad lighting shared by XY and custom faders."""
+    ) -> LedColor:
+        """Generic firmware-style fader pad lighting shared by XY and custom faders.
+
+        Stays MK1-agnostic (no explicit mk1) because custom-mode faders use
+        user-loaded palette indices we can't predict; first-gen reverse-maps the
+        index. If a specific caller (e.g. XY) wants a deliberate MK1 value, set it
+        at that call site rather than here, so custom faders keep the old method.
+        """
         state, micro = pad_fader.progress_for_pad(pad, current_value)
         if state == "off":
-            return PAD_DISABLED, None
+            return LedColor(PAD_DISABLED)
         if state == "dim":
-            return off_color, None
+            return LedColor(off_color)
         if state == "full":
-            return on_color, None
+            return LedColor(on_color)
         if micro is None:
-            return on_color, None
+            return LedColor(on_color)
         brightness = self._CUSTOM_FADER_MICRO_BRIGHTNESS[micro]
-        return on_color, led_display.dim_palette_rgb(on_color, brightness)
+        return LedColor(on_color, led_display.dim_palette_rgb(on_color, brightness))
 
     def _handle_step_sequencer_pad(self, event, pad: int, velocity: int, pressed: bool) -> bool:
         """Handle step sequencer mode - delegates to step_sequencer module."""
@@ -1582,14 +1600,14 @@ class LaunchpadSurface:
             cl.set_lock(self.state, ctx, channel)
         self._save_state()
 
-    def _step_lock_page_lighting(self, pad: int) -> tuple[int, tuple[int, int, int] | None]:
+    def _step_lock_page_lighting(self, pad: int) -> LedColor:
         channel = self._step_lock_page_channel
         ctx = self._step_lock_page_context_for_pad(pad)
         if ctx is None:
-            return PAD_DISABLED, None
+            return LedColor(PAD_DISABLED)
         if channel is not None and cl.is_locked(self.state, ctx) and cl.get(self.state, ctx) == channel:
-            return LP3_MENU_LOCKED, None
-        return LP3_MENU_INACTIVE, None
+            return LedColor(LP3_MENU_LOCKED)
+        return LedColor(LP3_MENU_INACTIVE)
 
     # Performance-mode pad handling
     def _handle_performance_pad(self, event, pad: int, velocity: int, pressed: bool) -> None:
@@ -1648,9 +1666,9 @@ class LaunchpadSurface:
         return False
     def _plugin_pad_override_lighting(
         self, override_id: str, pad: int
-    ) -> tuple[int, tuple[int, int, int] | None]:
+    ) -> LedColor:
         if override_id != PLUGIN_PAD_OVERRIDE_GROSS_BEAT:
-            return PAD_DISABLED, None
+            return LedColor(PAD_DISABLED)
         return self._gross_beat_lighting(pad)
     def _handle_gross_beat_pad(self, _event, pad: int, pressed: bool) -> bool:
         if fm.is_fpc_selector(pad):
@@ -1690,7 +1708,7 @@ class LaunchpadSurface:
             self._refresh_needed = False
             return True
         return True
-    def _gross_beat_lighting(self, pad: int) -> tuple[int, tuple[int, int, int] | None]:
+    def _gross_beat_lighting(self, pad: int) -> LedColor:
         slot_mode = self._gross_beat_slot_mode()
         slot_color = (
             GROSS_BEAT_TIME_COLOR
@@ -1704,23 +1722,22 @@ class LaunchpadSurface:
         )
         if pad == GROSS_BEAT_TOGGLE_PAD:
             if pad in self._plugin_override_held_pads:
-                return PAD_ACTION, None
-            return GROSS_BEAT_VOLUME_COLOR, None
+                return LedColor(PAD_ACTION)
+            return LedColor(GROSS_BEAT_VOLUME_COLOR)
         if self._gross_beat_fader.contains(pad):
             target = self._focused_plugin_target()
             spec = self._gross_beat_spec(target) if target is not None else None
             current_value = 0.0
             if spec is not None:
                 current_value = self._plugin_param_value(target, spec["mix_param"])
-            return (
+            return LedColor(
                 self._gross_beat_fader.palette_for_pad(
                     pad,
                     current_value,
                     dim_palette=GROSS_BEAT_FADER_DIM_COLOR,
                     bright_palettes=GROSS_BEAT_FADER_MICRO_COLORS,
                     off_palette=LP3_BACKGROUND_OFF,
-                ),
-                None,
+                )
             )
         if pad in GROSS_BEAT_SLOT_PADS:
             target = self._focused_plugin_target()
@@ -1728,21 +1745,21 @@ class LaunchpadSurface:
             slot_index = GROSS_BEAT_SLOT_PADS.index(pad)
             active_slot = self._gross_beat_active_slot(target, spec)
             if active_slot == slot_index:
-                return selected_slot_color, None
+                return LedColor(selected_slot_color)
             if pad in self._plugin_override_held_pads:
-                return PAD_ACTION, None
-            return slot_color, None
+                return LedColor(PAD_ACTION)
+            return LedColor(slot_color)
         if fm.is_fpc_selector(pad):
-            return fm.fpc_selector_color(
+            return LedColor(fm.fpc_selector_color(
                 pad,
                 self.state,
                 lambda: fm.selected_channel_is_fpc(self._selected_channel()),
                 self._selected_channel,
                 hide_if_not_fpc=True,
-            ), None
+            ))
         if pad in SETTINGS_GRID_PADS:
-            return LP3_BACKGROUND_OFF, None
-        return PAD_DISABLED, None
+            return LedColor(LP3_BACKGROUND_OFF)
+        return LedColor(PAD_DISABLED)
     def _gross_beat_slot_mode(self) -> str:
         mode = str(self.state.get("gross_beat_slot_mode", "time")).lower()
         return "volume" if mode == "volume" else "time"
@@ -1966,43 +1983,48 @@ class LaunchpadSurface:
         if self._custom_mode_index % n_slots == slot:
             return self._custom_mode_index
         return slot
-    def _custom_mode_lighting(self, pad: int) -> tuple[int, tuple[int, int, int] | None]:
+    def _custom_mode_lighting(self, pad: int) -> LedColor:
+        # Custom modes are user-loaded .syx files, so their palette indices are
+        # arbitrary and unpredictable — we can't assign meaningful page-level MK1
+        # values here. Every LedColor below is left with mk1=None on purpose, so
+        # first-gen hardware derives red/green from the index's MK3-palette RGB
+        # (the shared RGB pipeline). Do not add explicit mk1= values here.
         # Persistent selector sidebar: right column shows one LED per available mode slot.
         slot = ps.pad_to_slot(pad)
         if slot is not None:
             display_index = self._custom_slot_display_index(slot)
             if display_index is None:
-                return PAD_DISABLED, None
+                return LedColor(PAD_DISABLED)
             n_slots = len(ps.SELECTOR_PADS)
             mode = self._custom_modes[min(display_index, len(self._custom_modes) - 1)]
             active = self._custom_mode_index % n_slots == slot
             color = mode.on_color if active else LP3_MENU_INACTIVE
-            return color, None
+            return LedColor(color)
         # Grid pads: show the pad's off_color from the active custom mode
         mode = self._active_custom_mode()
         if mode is None:
-            return PAD_DISABLED, None
+            return LedColor(PAD_DISABLED)
         fader = mode.fader_for_pad(pad)
         if fader is not None:
             key = (mode.slot, fader.fader_index)
             pf = self._custom_fader_helpers.get(key)
             if pf is None:
-                return PAD_DISABLED, None
+                return LedColor(PAD_DISABLED)
             current = self._custom_fader_values.get(key, 0.0)
             return self._custom_fader_lighting(pf, fader, pad, current)
         cp = mode.pad(pad)
         if cp is None or cp.is_off:
-            return PAD_DISABLED, None
+            return LedColor(PAD_DISABLED)
         if pad in self.active_pads:
-            return mode.on_color, None
-        return cp.off_color, None
+            return LedColor(mode.on_color)
+        return LedColor(cp.off_color)
     def _custom_fader_lighting(
         self,
         pad_fader: PadFader,
         fader: cm.CustomFader,
         pad: int,
         current_value: float,
-    ) -> tuple[int, tuple[int, int, int] | None]:
+    ) -> LedColor:
         return self._fader_pad_lighting(
             pad_fader, fader.on_color, fader.off_color, pad, current_value
         )
@@ -2018,11 +2040,11 @@ class LaunchpadSurface:
             return not pm.performance_available()
         return False
 
-    def _grid_lighting(self, pad: int) -> tuple[int, tuple[int, int, int] | None]:
+    def _grid_lighting(self, pad: int) -> LedColor:
         if self._lights_effectively_out():
-            return PAD_DISABLED, None
+            return LedColor(PAD_DISABLED)
         if self.settings_visible:
-            return nm.settings_color(pad, self.state), None
+            return nm.settings_color(pad, self.state)
         if self.surface_mode == MODE_XY_PAD:
             return self._xy_lighting(pad)
         if self.surface_mode == MODE_STEP_SEQ:
@@ -2069,8 +2091,10 @@ class LaunchpadSurface:
                 self._channel_for_pad,
                 self._playable_pads(),
             )
-        return PAD_DISABLED, None
+        return LedColor(PAD_DISABLED)
     def _top_color(self, cc: int) -> int:
+        # Returns a bare palette index; refresh_surface normalises it to a
+        # LedColor (top CCs don't yet set explicit MK1 values).
         if self._lights_effectively_out():
             return PAD_DISABLED
         if cc == self._top_octave_down:
@@ -2097,6 +2121,7 @@ class LaunchpadSurface:
                     self.surface_mode,
                     nm.remaining_octave_steps(self.state, -1, self.surface_mode),
                     LP3_ARROW_OCTAVE_ACTIVE,
+                    out_of_range=not nm.is_window_valid(self.state),
                 )
             return LP3_ARROW_INACTIVE
         if cc == self._top_octave_up:
@@ -2123,6 +2148,7 @@ class LaunchpadSurface:
                     self.surface_mode,
                     nm.remaining_octave_steps(self.state, 1, self.surface_mode),
                     LP3_ARROW_OCTAVE_ACTIVE,
+                    out_of_range=not nm.is_window_valid(self.state),
                 )
             return LP3_ARROW_INACTIVE
         if cc == self._top_pan_left:
@@ -2150,6 +2176,7 @@ class LaunchpadSurface:
                     self.surface_mode,
                     nm.remaining_pan_steps(self.state, -1, self.surface_mode),
                     LP3_ARROW_PAN_ACTIVE,
+                    out_of_range=not nm.is_window_valid(self.state),
                 )
             return LP3_ARROW_INACTIVE
         if cc == self._top_pan_right:
@@ -2177,6 +2204,7 @@ class LaunchpadSurface:
                     self.surface_mode,
                     nm.remaining_pan_steps(self.state, 1, self.surface_mode),
                     LP3_ARROW_PAN_ACTIVE,
+                    out_of_range=not nm.is_window_valid(self.state),
                 )
             return LP3_ARROW_INACTIVE
         if cc == self._top_performance:
@@ -2375,6 +2403,18 @@ class LaunchpadSurface:
         finally:
             self._restoring_mode = False
 
+    def _send_mk1_duty_cycle(self) -> None:
+        """Send the MK1 'set duty cycle' (brightness) SysEx-free CC, per the
+        Launchpad S PRM. Brightness = numerator/denominator, configured via
+        MK1_DUTY_CYCLE_NUMERATOR / MK1_DUTY_CYCLE_DENOMINATOR in constants.py."""
+        numerator   = MK1_DUTY_CYCLE_NUMERATOR
+        denominator = MK1_DUTY_CYCLE_DENOMINATOR
+        if numerator < 9:
+            cc, value = 0x1E, 16 * (numerator - 1) + (denominator - 3)
+        else:
+            cc, value = 0x1F, 16 * (numerator - 9) + (denominator - 3)
+        device.midiOutMsg(midi.MIDI_CONTROLCHANGE, SESSION_CHANNEL, cc, value)
+
     def _enter_session_default(self) -> None:
         """Session key default surface: Performance when FL performance mode is
         on, otherwise the XY/faders page."""
@@ -2421,8 +2461,6 @@ class LaunchpadSurface:
                 top_ccs=self._top_ccs,
                 side_column_is_cc=True,
                 mode="lp3",
-                swap_red_blue=False,
-                swap_input_red_blue=True,
                 color_saturation=FPC_COLOR_SATURATION_LP3,
                 color_gamma=FPC_COLOR_GAMMA_LP3,
             )
@@ -2443,8 +2481,6 @@ class LaunchpadSurface:
                 top_ccs=self._top_ccs,
                 side_column_is_cc=True,
                 mode="lp3",
-                swap_red_blue=False,
-                swap_input_red_blue=True,
                 color_saturation=FPC_COLOR_SATURATION_LP3,
                 color_gamma=FPC_COLOR_GAMMA_LP3,
             )
@@ -2468,11 +2504,10 @@ class LaunchpadSurface:
                 top_ccs=self._top_ccs,
                 side_column_is_cc=False,
                 mode="mk1",
-                swap_red_blue=False,
-                swap_input_red_blue=False,
-                color_saturation=FPC_COLOR_SATURATION_MK2,
-                color_gamma=FPC_COLOR_GAMMA_MK2,
+                color_saturation=FPC_COLOR_SATURATION_MK1,
+                color_gamma=FPC_COLOR_GAMMA_MK1,
             )
+            self._send_mk1_duty_cycle()
         else:
             self.device_label = "Launchpad MK2"
             self._side_column_is_cc = False
@@ -2490,8 +2525,6 @@ class LaunchpadSurface:
                 top_ccs=self._top_ccs,
                 side_column_is_cc=False,
                 mode="mk2",
-                swap_red_blue=False,
-                swap_input_red_blue=True,
                 color_saturation=FPC_COLOR_SATURATION_MK2,
                 color_gamma=FPC_COLOR_GAMMA_MK2,
             )

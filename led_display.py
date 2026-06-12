@@ -7,7 +7,11 @@
 from fl_stubs import device, midi
 from constants import (
     PALETTE_RGB_BY_FAMILY,
-    MK1_VELOCITY_TABLE,
+    LP3_PALETTE_RGB,
+    mk1_velocity_from_rgb,
+    mk1_velocity_from_rg,
+    mk1_fold_blue,
+    LedColor,
     SYSEX_PREFIX,
     SYSEX_LED_SET,
     SYSEX_LED_SET_RGB,
@@ -20,12 +24,11 @@ from constants import (
     TOP_CCS,
     PAD_OFF,
     PAD_ROOT,
-    PAD_IN_SCALE,
     PAD_ACTION,
-    PAD_SELECTED,
-    PAD_HELD,
+    LP3_MENU_LOCKED,
     FPC_COLOR_SATURATION_MK2,
     FPC_COLOR_GAMMA_MK2,
+    pad_to_mk1_note,
 )
 _config = {
     "sysex_prefix": SYSEX_PREFIX,
@@ -34,8 +37,6 @@ _config = {
     "mode": "mk2",
     "lp3_programmer_toggle": 0x0E,
     "lp3_led_command": 0x03,
-    "swap_red_blue": False,
-    "swap_input_red_blue": False,
     "color_saturation": FPC_COLOR_SATURATION_MK2,
     "color_gamma": FPC_COLOR_GAMMA_MK2,
 }
@@ -50,8 +51,6 @@ def configure_surface(
     top_ccs=TOP_CCS,
     side_column_is_cc=False,
     mode="mk2",
-    swap_red_blue=False,
-    swap_input_red_blue=False,
     color_saturation=FPC_COLOR_SATURATION_MK2,
     color_gamma=FPC_COLOR_GAMMA_MK2,
 ) -> None:
@@ -59,16 +58,8 @@ def configure_surface(
     _config["top_ccs"] = tuple(int(value) for value in top_ccs)
     _config["side_column_is_cc"] = bool(side_column_is_cc)
     _config["mode"] = mode
-    _config["swap_red_blue"] = bool(swap_red_blue)
-    _config["swap_input_red_blue"] = bool(swap_input_red_blue)
     _config["color_saturation"] = max(0.0, float(color_saturation))
     _config["color_gamma"] = max(0.01, float(color_gamma))
-
-def _encode_rgb(rgb_color: tuple[int, int, int]) -> tuple[int, int, int]:
-    red, green, blue = rgb_color
-    if _config["swap_red_blue"]:
-        return blue, green, red
-    return red, green, blue
 
 def rgb_max_value() -> int:
     return 127 if _config["mode"] == "lp3" else 63
@@ -108,8 +99,8 @@ def _native_palette_rgb(palette_index: int) -> tuple[int, int, int]:
 
 def _lp3_colorspec(pad: int, palette_color: int, rgb_color: tuple[int, int, int] | None) -> list[int]:
     if rgb_color is not None:
-        encoded_red, encoded_green, encoded_blue = _encode_rgb(rgb_color)
-        return [0x03, pad, encoded_red, encoded_green, encoded_blue]
+        red, green, blue = rgb_color
+        return [0x03, pad, red, green, blue]
     return [0x00, pad, palette_color]
 
 def set_layout(layout: int) -> None:
@@ -125,7 +116,7 @@ def clear_surface(grid_led_cache: dict, top_led_cache: dict) -> None:
     if _config["mode"] == "mk1":
         # MK1: individual note-on messages, velocity=12 (red=0,green=0,flags=12=off).
         for pad in PLAYABLE_PADS:
-            device.midiOutMsg(midi.MIDI_NOTEON, SESSION_CHANNEL, pad, 12)
+            device.midiOutMsg(midi.MIDI_NOTEON, SESSION_CHANNEL, pad_to_mk1_note(pad), 12)
         for cc in _config["top_ccs"]:
             device.midiOutMsg(midi.MIDI_CONTROLCHANGE, SESSION_CHANNEL, cc, 12)
     elif _config["mode"] != "lp3":
@@ -143,18 +134,48 @@ def clear_surface(grid_led_cache: dict, top_led_cache: dict) -> None:
     top_led_cache.clear()
 
 def _mk1_velocity(palette_index: int) -> int:
-    """Convert a palette index to a MK1 LED velocity (red/green 2-bit encoding)."""
-    idx = int(palette_index)
-    if 0 <= idx < len(MK1_VELOCITY_TABLE):
-        return MK1_VELOCITY_TABLE[idx]
-    return 12  # off
+    """Convert a palette index to a MK1 LED velocity (red/green 2-bit encoding).
 
-def send_grid_led_fallback(pad: int, color: int) -> None:
+    The index is looked up in the MK3 (LP3) palette to get its true RGB, then
+    run through the same blue-fold + saturation/gamma pipeline as RGB pads
+    (rgb6_from_rgb in mk1 mode) and quantized.  This keeps indexed pads and
+    RGB pads consistent on first-gen hardware, instead of relying on a separate
+    hand-tuned per-index table.
+    """
+    idx = int(palette_index)
+    if 0 <= idx < len(LP3_PALETTE_RGB):
+        red, green, blue = LP3_PALETTE_RGB[idx]
+    else:
+        red, green, blue = (0, 0, 0)
+    # rgb6_from_rgb (mk1 mode) folds blue into red/green, applies the configured
+    # MK1 saturation/gamma, and scales to the 0-63 range mk1_velocity expects.
+    tuned_r, tuned_g, _tuned_b = rgb6_from_rgb(red, green, blue)
+    return mk1_velocity_from_rgb(tuned_r, tuned_g, maximum=rgb_max_value())
+
+def _mk1_velocity_for(color: int, rgb_color: tuple[int, int, int] | None, mk1: int | None) -> int:
+    """Resolve a MK1 LED velocity, honouring an explicit page-level mk1 value.
+
+    An explicit *mk1* (two-digit RG) always wins.  Otherwise an RGB colour is
+    folded down to red/green, and a bare palette index uses the reverse-map.
+    """
+    if mk1 is not None:
+        return mk1_velocity_from_rg(mk1)
+    if rgb_color is not None:
+        red, green, _blue = rgb_color
+        return mk1_velocity_from_rgb(red, green, maximum=rgb_max_value())
+    return _mk1_velocity(color)
+
+def send_grid_led_fallback(
+    pad: int,
+    color: int,
+    rgb_color: tuple[int, int, int] | None = None,
+    mk1: int | None = None,
+) -> None:
     if _config["mode"] == "lp3":
         return
     if _config["mode"] == "mk1":
-        velocity = _mk1_velocity(color)
-        device.midiOutMsg(midi.MIDI_NOTEON, SESSION_CHANNEL, pad, velocity)
+        velocity = _mk1_velocity_for(color, rgb_color, mk1)
+        device.midiOutMsg(midi.MIDI_NOTEON, SESSION_CHANNEL, pad_to_mk1_note(pad), velocity)
         return
     if _config["side_column_is_cc"] and pad not in SETTINGS_GRID_PADS:
         device.midiOutMsg(midi.MIDI_CONTROLCHANGE, SESSION_CHANNEL, pad, color)
@@ -166,11 +187,11 @@ def send_grid_led_fallback(pad: int, color: int) -> None:
         else:
             device.midiOutMsg(midi.MIDI_NOTEON, channel, pad, color)
 
-def send_top_led_fallback(cc: int, color: int) -> None:
+def send_top_led_fallback(cc: int, color: int, mk1: int | None = None) -> None:
     if _config["mode"] == "lp3":
         return
     if _config["mode"] == "mk1":
-        velocity = _mk1_velocity(color)
+        velocity = _mk1_velocity_for(color, None, mk1)
         device.midiOutMsg(midi.MIDI_CONTROLCHANGE, SESSION_CHANNEL, cc, velocity)
         return
     device.midiOutMsg(midi.MIDI_CONTROLCHANGE, SESSION_CHANNEL, cc, color)
@@ -197,9 +218,24 @@ def send_top_led_pulse(cc: int, color: int) -> None:
 
 def send_top_led_rgb(cc: int, rgb: tuple[int, int, int]) -> None:
     """Set a top-row LED to an explicit 6-bit RGB value (MK2 only)."""
-    r, g, b = _encode_rgb(rgb)
+    r, g, b = rgb
     message = list(_config["sysex_prefix"]) + [SYSEX_LED_SET_RGB, cc, r, g, b, 0xF7]
     device.midiOutSysex(_sysex_bytes(message))
+
+def _as_led_color(value) -> LedColor:
+    """Normalise a lighting-fn return into a LedColor.
+
+    Accepts a LedColor, a legacy (index, rgb) pair, or a bare palette index.
+    """
+    if isinstance(value, LedColor):
+        return value
+    if isinstance(value, tuple):
+        if len(value) >= 3:
+            return LedColor(value[0], value[1], value[2])
+        if len(value) == 2:
+            return LedColor(value[0], value[1], None)
+        return LedColor(value[0], None, None)
+    return LedColor(int(value), None, None)
 
 # Batch surface refresh
 def refresh_surface(
@@ -211,8 +247,8 @@ def refresh_surface(
     pulse_grid_pads: set | None = None,
 ) -> None:
     """Recompute every LED and flush changed values via sysex.
-    *grid_lighting_fn(pad)* → (palette_color, rgb | None)
-    *top_color_fn(cc)*      → palette_color
+    *grid_lighting_fn(pad)* → LedColor (index, rgb | None, mk1 | None)
+    *top_color_fn(cc)*      → LedColor or bare palette index
     *pulse_top_ccs*         → CCs that should pulse; excluded from the static
                               batch so a subsequent send_top_led_pulse call wins
                               cleanly with no static override to cancel it.
@@ -225,23 +261,24 @@ def refresh_surface(
         if pulse_grid_pads and pad in pulse_grid_pads:
             grid_led_cache.pop(pad, None)
             continue
-        palette_color, rgb_color = grid_lighting_fn(pad)
-        if grid_led_cache.get(pad) == (palette_color, rgb_color):
+        led = _as_led_color(grid_lighting_fn(pad))
+        if grid_led_cache.get(pad) == led:
             continue
-        grid_led_cache[pad] = (palette_color, rgb_color)
+        grid_led_cache[pad] = led
+        palette_color, rgb_color = led.index, led.rgb
         # For RGB pads on MK2/LP3 the batched RGB sysex (flushed once after the
         # loop) is the authoritative update.  Sending the per-pad palette
         # approximation first paints a brighter, wrong colour that the RGB batch
         # then overwrites — on MK2 that interim shows as a one-frame flash across
         # a freshly-scrolled grid.  Only MK1 (no sysex) needs the RGB fallback.
         if rgb_color is None or _config["mode"] == "mk1":
-            send_grid_led_fallback(pad, fallback_palette(palette_color, rgb_color))
+            send_grid_led_fallback(pad, fallback_palette(palette_color, rgb_color), rgb_color, led.mk1)
         if rgb_color is not None:
             if _config["mode"] == "lp3":
                 rgb_entries.extend(_lp3_colorspec(pad, palette_color, rgb_color))
             else:
-                encoded_red, encoded_green, encoded_blue = _encode_rgb(rgb_color)
-                rgb_entries.extend((pad, encoded_red, encoded_green, encoded_blue))
+                red, green, blue = rgb_color
+                rgb_entries.extend((pad, red, green, blue))
         else:
             if _config["mode"] == "lp3":
                 pairs.extend(_lp3_colorspec(pad, palette_color, None))
@@ -251,11 +288,12 @@ def refresh_surface(
         if pulse_top_ccs and cc in pulse_top_ccs:
             top_led_cache.pop(cc, None)
             continue
-        color = top_color_fn(cc)
-        if top_led_cache.get(cc) == color:
+        led = _as_led_color(top_color_fn(cc))
+        if top_led_cache.get(cc) == led:
             continue
-        top_led_cache[cc] = color
-        send_top_led_fallback(cc, color)
+        top_led_cache[cc] = led
+        color = led.index
+        send_top_led_fallback(cc, color, led.mk1)
         if _config["mode"] == "lp3":
             pairs.extend(_lp3_colorspec(cc, color, None))
         else:
@@ -282,12 +320,13 @@ def refresh_grid_pad(
     grid_led_cache: dict,
 ) -> None:
     """Refresh a single grid pad, skipping if the cache is still valid."""
-    palette_color, rgb_color = grid_lighting_fn(pad)
-    if grid_led_cache.get(pad) == (palette_color, rgb_color):
+    led = _as_led_color(grid_lighting_fn(pad))
+    if grid_led_cache.get(pad) == led:
         return
-    grid_led_cache[pad] = (palette_color, rgb_color)
+    grid_led_cache[pad] = led
+    palette_color, rgb_color = led.index, led.rgb
     fallback_color = fallback_palette(palette_color, rgb_color)
-    send_grid_led_fallback(pad, fallback_color)
+    send_grid_led_fallback(pad, fallback_color, rgb_color, led.mk1)
     # MK1 has no SysEx LED commands; fallback already sent the note-on.
     if _config["mode"] == "mk1":
         return
@@ -300,13 +339,13 @@ def refresh_grid_pad(
     elif rgb_color is None:
         message = list(_config["sysex_prefix"]) + [SYSEX_LED_SET, pad, palette_color, 0xF7]
     else:
-        encoded_red, encoded_green, encoded_blue = _encode_rgb(rgb_color)
+        red, green, blue = rgb_color
         message = list(_config["sysex_prefix"]) + [
             SYSEX_LED_SET_RGB,
             pad,
-            encoded_red,
-            encoded_green,
-            encoded_blue,
+            red,
+            green,
+            blue,
             0xF7,
     ]
     device.midiOutSysex(_sysex_bytes(message))
@@ -316,20 +355,29 @@ def fallback_palette(
     palette_color: int,
     rgb_color: tuple[int, int, int] | None,
 ) -> int:
-    """Map an RGB colour to the nearest useful MK2 palette index."""
+    """Map an RGB colour to the nearest useful palette index.
+
+    On MK1-protocol hardware (Launchpad S and similar) LEDs are red/green
+    only — there is no blue element. Any blue contribution is folded into
+    red and green so that, e.g., cyan/magenta/blue still light up rather
+    than collapsing to a single hue.
+    """
     if rgb_color is None:
         return palette_color
     red, green, blue = rgb_color
-    brightness = red + green + blue
+    # Fold blue into red and green equally, since MK1 hardware can't show it.
+    red = red + blue // 2
+    green = green + blue // 2
+    brightness = red + green
     if brightness <= 6:
         return PAD_OFF
-    if red >= 48 and green >= 48 and blue >= 48:
-        return PAD_HELD
-    if red >= green and red >= blue:
-        return PAD_ROOT if green < 20 else PAD_ACTION
-    if green >= red and green >= blue:
-        return PAD_IN_SCALE
-    return PAD_SELECTED
+    # Roughly equal red/green -> amber/yellow (also covers white, which MK1
+    # hardware can't distinguish from yellow without a blue element).
+    if abs(red - green) <= max(red, green) // 4:
+        return LP3_MENU_LOCKED
+    if red > green:
+        return PAD_ACTION
+    return PAD_ROOT
 
 def apply_fpc_color_tuning(red: int, green: int, blue: int) -> tuple[int, int, int]:
     """Saturation-boost + gamma-correct an 8-bit RGB triple."""
@@ -370,12 +418,14 @@ def rgb6_from_rgb(
     saturation: float | None = None,
     gamma: float | None = None,
 ) -> tuple[int, int, int]:
-    if _config["swap_input_red_blue"]:
-        red, blue = blue, red
     if saturation is None:
         saturation = float(_config["color_saturation"])
     if gamma is None:
         gamma = float(_config["color_gamma"])
+    if _config["mode"] == "mk1":
+        # Fold blue into red/green before tuning, so saturation/gamma can
+        # re-punch-up whatever brightness the fold dulled.
+        red, green, blue = mk1_fold_blue(red, green, blue)
     red, green, blue = apply_color_tuning(
         red,
         green,
@@ -392,10 +442,10 @@ def rgb6_from_color(
     saturation: float | None = None,
     gamma: float | None = None,
 ) -> tuple[int, int, int]:
-    """Unpack a packed FL colour and convert it for the active Launchpad profile."""
-    red  = color & 0xFF
+    """Unpack a packed FL/FPC colour and convert it for the active Launchpad profile."""
+    blue  = color & 0xFF
     green = (color >> 8) & 0xFF
-    blue   = (color >> 16) & 0xFF
+    red   = (color >> 16) & 0xFF
     return rgb6_from_rgb(
 
         red,
@@ -404,4 +454,3 @@ def rgb6_from_color(
         saturation=saturation,
         gamma=gamma,
     )
-# gargoyles rule

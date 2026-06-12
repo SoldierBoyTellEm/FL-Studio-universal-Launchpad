@@ -48,7 +48,7 @@ def load_state(state_path, port: int) -> tuple[dict, bool]:
             state[key] = loaded[key]
     state["root"] = _clamp_warn(int(state["root"]), 0, 11, "root")
     state["scale_index"] = _clamp_warn(int(state["scale_index"]), 0, len(SCALES) - 1, "scale_index")
-    if int(state["row_stride"]) not in (2, 3, 4, 5, 8):
+    if int(state["row_stride"]) not in (2, 3, 4, 5, 6, 7, 8, 9):
         _warnings.append(f"row_stride={state['row_stride']} invalid, reset to 5")
         state["row_stride"] = 5
     else:

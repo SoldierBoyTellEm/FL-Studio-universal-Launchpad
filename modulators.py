@@ -19,6 +19,7 @@ from constants import (
     PAD_DISABLED,
     LP3_MENU_ACTIVE,
     LP3_MENU_INACTIVE,
+    LedColor,
     XY_PAD_X_CC,
     XY_PAD_Y_CC,
     XY_VERT_FADER_CCS,
@@ -296,14 +297,14 @@ def selector_lighting(
     page_count: int,
     active_color: int = LP3_MENU_ACTIVE,
     inactive_color: int = LP3_MENU_INACTIVE,
-) -> tuple[int, tuple[int, int, int] | None]:
+) -> LedColor:
     """LED colour for a right-column pad given the active page and total count."""
     slot = pad_to_slot(pad)
     if slot is None or slot >= page_count:
-        return PAD_DISABLED, None
+        return LedColor(PAD_DISABLED)
     if slot == active_index:
-        return active_color, None
-    return inactive_color, None
+        return LedColor(active_color)
+    return LedColor(inactive_color)
 
 def handle_press(pad: int, active_index: int, page_count: int) -> int:
     """Return the new active page index after pressing a selector pad."""
@@ -371,11 +372,11 @@ def xy_grid_lighting(
     pad: int,
     cursor_x: int | None,
     cursor_y: int | None,
-) -> tuple[int, tuple[int, int, int] | None]:
+) -> LedColor:
     """Crosshair lighting for the XY page: active row+column dim, intersection bright."""
     xy = pad_to_xy(pad)
     if xy is None:
-        return PAD_DISABLED, None
+        return LedColor(PAD_DISABLED)
     if cursor_x is not None and cursor_y is not None:
         pad_x, pad_y = xy
         cursor_col = int(round(cursor_x / 127 * 7))
@@ -383,8 +384,8 @@ def xy_grid_lighting(
         on_col = pad_x == cursor_col
         on_row = pad_y == cursor_row
         if on_col and on_row:
-            return LP3_MENU_ACTIVE, None
+            return LedColor(LP3_MENU_ACTIVE)
         if on_col or on_row:
-            return LP3_MENU_INACTIVE, None
-    return PAD_DISABLED, None
+            return LedColor(LP3_MENU_INACTIVE)
+    return LedColor(PAD_DISABLED)
 # gargoyles rule

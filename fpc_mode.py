@@ -20,6 +20,7 @@ from constants import (
     PAD_AVAILABLE,
     PAD_DISABLED,
     PAD_OFF,
+    LedColor,
 )
 from led_display import rgb6_from_color, rgb_max_value
 
@@ -313,14 +314,14 @@ def fpc_lighting(
     is_pad_recently_active_fn,
     page_index: int | None = None,
     allow_fallback_to_selected: bool = False,
-) -> tuple[int, tuple[int, int, int] | None]:
-    """Return (palette_colour, rgb | None) for *pad* in FPC mode."""
+) -> LedColor:
+    """Return the LedColor for *pad* in FPC mode."""
     if is_fpc_selector(pad):
-        return fpc_selector_color(
+        return LedColor(fpc_selector_color(
             pad, state, selected_channel_is_fpc_fn, selected_channel_fn, hide_if_not_fpc=True
-        ), None
+        ))
     if pad not in SETTINGS_GRID_PADS:
-        return PAD_DISABLED, None
+        return LedColor(PAD_DISABLED)
     assignment = fpc_assignment_for_pad(
         pad,
         state,
@@ -329,7 +330,7 @@ def fpc_lighting(
         allow_fallback_to_selected=allow_fallback_to_selected,
     )
     if assignment is None:
-        return PAD_DISABLED, None
+        return LedColor(PAD_DISABLED)
     return fpc_lighting_for_assignment(
         pad,
         assignment,
@@ -344,7 +345,7 @@ def fpc_performance_lighting(
     is_note_active_fn,
     is_pad_recently_active_fn,
     allow_fallback_to_selected: bool = False,
-) -> tuple[int, tuple[int, int, int] | None]:
+) -> LedColor:
     assignment = fpc_assignment_for_performance_pad(
         pad,
         state,
@@ -352,7 +353,7 @@ def fpc_performance_lighting(
         allow_fallback_to_selected=allow_fallback_to_selected,
     )
     if assignment is None:
-        return PAD_DISABLED, None
+        return LedColor(PAD_DISABLED)
     return fpc_lighting_for_assignment(
         pad,
         assignment,
@@ -365,10 +366,10 @@ def fpc_lighting_for_assignment(
     assignment: tuple[int, int],
     is_note_active_fn,
     is_pad_recently_active_fn,
-) -> tuple[int, tuple[int, int, int] | None]:
+) -> LedColor:
     channel_index, pad_index = assignment
     if not 0 <= pad_index < fpc_pad_count(channel_index):
-        return PAD_OFF, (0, 0, 0)
+        return LedColor(PAD_OFF, (0, 0, 0))
     note = fpc_pad_note(channel_index, pad_index)
     rgb  = fpc_pad_color(channel_index, pad_index)
     if (
@@ -378,7 +379,7 @@ def fpc_lighting_for_assignment(
     ):
         maximum = rgb_max_value()
         rgb = tuple(min(maximum, c + 18) for c in rgb)
-    return PAD_OFF, rgb
+    return LedColor(PAD_OFF, rgb)
 # Selected-channel helpers (used by the main class)
 
 def selected_plugin_name(channel_index: int) -> str:

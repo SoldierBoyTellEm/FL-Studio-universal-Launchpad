@@ -24,6 +24,7 @@ from constants import (
     STEP_SEQUENCER_HEIGHT,
     STEP_SEQUENCER_MAX_STEPS,
     DEFAULT_FL_CHANNEL_RGB,
+    LedColor,
 )
 from led_display import rgb6_from_color, rgb6_from_rgb, rgb_max_value, surface_mode
 
@@ -134,17 +135,17 @@ def arrow_color(remaining_steps: int, active_color: int) -> int:
         return LP3_ARROW_INACTIVE
     return active_color
 
-def lighting(pad: int, state: dict) -> tuple[int, tuple[int, int, int] | None]:
+def lighting(pad: int, state: dict) -> LedColor:
     channel_index = channel_for_pad(pad, state)
     if channel_index < 0 or channel_index >= channel_count():
-        return PAD_DISABLED, None
+        return LedColor(PAD_DISABLED)
 
     if is_channel_toggle_pad(pad):
         return channel_toggle_lighting(channel_index)
 
     step = step_for_pad(pad, state)
     if step < 0 or step >= STEP_SEQUENCER_MAX_STEPS:
-        return PAD_DISABLED, None
+        return LedColor(PAD_DISABLED)
 
     is_on = get_step(channel_index, step)
     under_playhead = step == playhead_step()
@@ -164,11 +165,11 @@ def lighting(pad: int, state: dict) -> tuple[int, tuple[int, int, int] | None]:
             saturation=saturation,
             gamma=gamma,
         )
-        return PAD_DISABLED, rgb
+        return LedColor(PAD_DISABLED, rgb)
 
     if channel_index == selected_channel():
-        return LP3_STEP_SELECTED, None
-    return (LP3_STEP_ON if is_on else LP3_STEP_OFF), None
+        return LedColor(LP3_STEP_SELECTED)
+    return LedColor(LP3_STEP_ON if is_on else LP3_STEP_OFF)
 
 def sync_channel_rack_view(state: dict) -> None:
     global _last_channel_rack_rect
@@ -323,7 +324,7 @@ def set_step(channel_index: int, step: int, value: bool) -> None:
     except Exception:
         return
 
-def channel_toggle_lighting(channel_index: int) -> tuple[int, tuple[int, int, int] | None]:
+def channel_toggle_lighting(channel_index: int) -> LedColor:
     rgb = _channel_rgb_uncorrected(channel_index)
     muted = is_channel_muted(channel_index)
     selected = channel_index == selected_channel()
@@ -341,13 +342,13 @@ def channel_toggle_lighting(channel_index: int) -> tuple[int, tuple[int, int, in
             saturation=saturation,
             gamma=gamma,
         )
-        return PAD_DISABLED, rgb
+        return LedColor(PAD_DISABLED, rgb)
 
     if muted:
-        return LP3_MENU_INACTIVE, None
+        return LedColor(LP3_MENU_INACTIVE)
     if selected:
-        return LP3_STEP_SELECTED, None
-    return LP3_MENU_ACTIVE, None
+        return LedColor(LP3_STEP_SELECTED)
+    return LedColor(LP3_MENU_ACTIVE)
 
 def _channel_rgb_uncorrected(channel_index: int) -> tuple[int, int, int] | None:
     try:

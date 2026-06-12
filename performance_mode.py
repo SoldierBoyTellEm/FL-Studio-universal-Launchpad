@@ -36,6 +36,7 @@ from constants import (
     LP3_MENU_ACTIVE,
     LP3_PERFORMANCE_READY,
     LP3_ARROW_INACTIVE,
+    LedColor,
 )
 from led_display import rgb6_from_color, rgb_max_value
 # Internal log helper (same prefix as the rest of the script)
@@ -138,31 +139,31 @@ def performance_lighting(
     pad: int,
     state: dict,
     fpc_lighting_fn,
-) -> tuple[int, tuple[int, int, int] | None]:
-    """Return (palette_colour, rgb | None) for *pad* in performance mode.
+) -> LedColor:
+    """Return the LedColor for *pad* in performance mode.
     *fpc_lighting_fn(pad)* is called for empty-pad hybrid fallback.
     """
     if pad not in PLAYABLE_PADS:
-        return PAD_DISABLED, None
+        return LedColor(PAD_DISABLED)
     if not performance_available():
-        return PAD_DISABLED, None
+        return LedColor(PAD_DISABLED)
     if pad in SIDE_COLUMN_PADS:
         target = page_hotkey_target(pad)
         if target is None:
-            return LP3_BACKGROUND_OFF, None
+            return LedColor(LP3_BACKGROUND_OFF)
         sel = selected_page_hotkey(state)
         if sel is None:
-            return LP3_BACKGROUND_OFF, None
-        return (LP3_MENU_ACTIVE if pad == sel else LP3_BACKGROUND_OFF), None
+            return LedColor(LP3_BACKGROUND_OFF)
+        return LedColor(LP3_MENU_ACTIVE if pad == sel else LP3_BACKGROUND_OFF)
     track = track_for_pad(pad, state)
     block = block_for_pad(pad, state)
     if track < 1 or track > performance_track_count():
-        return PAD_DISABLED, None
+        return LedColor(PAD_DISABLED)
     status = live_block_status(track, block)
     if status <= 0:
         if bool(state.get("performance_direct_audio", False)):
             return fpc_lighting_fn(pad)
-        return LP3_BACKGROUND_OFF, None
+        return LedColor(LP3_BACKGROUND_OFF)
     try:
         color = int(playlist.getLiveBlockColor(track, block))
     except Exception:
@@ -171,7 +172,7 @@ def performance_lighting(
     if status >= 2:
         maximum = rgb_max_value()
         rgb = tuple(min(maximum, c + 16) for c in rgb)
-    return PAD_OFF, rgb
+    return LedColor(PAD_OFF, rgb)
 
 # Direct-audio / hybrid mode
 def try_empty_pad_fallback(
