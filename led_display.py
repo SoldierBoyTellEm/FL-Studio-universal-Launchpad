@@ -16,6 +16,9 @@ from constants import (
     SYSEX_LED_SET,
     SYSEX_LED_SET_RGB,
     SYSEX_LIGHT_ALL,
+    SYSEX_SCROLL,
+    LP3_SYSEX_SCROLL,
+    LP3_SCROLL_SPEED,
     SYSEX_LAYOUT,
     SESSION_CHANNEL,
     USER2_FALLBACK_CHANNELS,
@@ -35,6 +38,8 @@ _config = {
     "top_ccs": TOP_CCS,
     "side_column_is_cc": False,
     "mode": "mk2",
+    "mk1_double_buffer": False,
+    "mk1_double_buffer_threshold": 12,
     "lp3_programmer_toggle": 0x0E,
     "lp3_led_command": 0x03,
     "color_saturation": FPC_COLOR_SATURATION_MK2,
@@ -51,6 +56,8 @@ def configure_surface(
     top_ccs=TOP_CCS,
     side_column_is_cc=False,
     mode="mk2",
+    mk1_double_buffer=False,
+    mk1_double_buffer_threshold=12,
     color_saturation=FPC_COLOR_SATURATION_MK2,
     color_gamma=FPC_COLOR_GAMMA_MK2,
 ) -> None:
@@ -58,6 +65,8 @@ def configure_surface(
     _config["top_ccs"] = tuple(int(value) for value in top_ccs)
     _config["side_column_is_cc"] = bool(side_column_is_cc)
     _config["mode"] = mode
+    _config["mk1_double_buffer"] = bool(mk1_double_buffer)
+    _config["mk1_double_buffer_threshold"] = max(1, int(mk1_double_buffer_threshold))
     _config["color_saturation"] = max(0.0, float(color_saturation))
     _config["color_gamma"] = max(0.01, float(color_gamma))
 
@@ -111,14 +120,62 @@ def set_layout(layout: int) -> None:
         data = list(_config["sysex_prefix"]) + [SYSEX_LAYOUT, layout, 0xF7]
     device.midiOutSysex(_sysex_bytes(data))
 
+def supports_text_scroll() -> bool:
+    """True on surfaces with the native scrolling-text SysEx (MK2, LPX, LPM3).
+
+    MK1-protocol hardware has no SysEx LED commands at all, so it has no
+    scroll either.
+    """
+    return _config["mode"] != "mk1"
+
+def scroll_text(text: str, color: int = 0, *, loop: bool = False) -> None:
+    """Scroll ASCII *text* across the pads using the native scroll SysEx.
+
+    The two device families speak different scroll dialects:
+      MK2:  prefix + 14h + <colour> + <loop> + <text> + F7        (PRM p.14)
+      MK3:  prefix + 07h + <loop> + <speed> + <colourspec> + <text> + F7
+            where <colourspec> = 00h <palette>                    (LPX PRM p.23)
+    *color* is a palette index in both cases.  When *loop* is False the
+    hardware plays the text once and then restores the LEDs on its own.
+    Non-ASCII bytes and the reserved speed codes (1-7) are dropped so they
+    can't corrupt the stream / change scroll speed mid-text.
+    """
+    if not supports_text_scroll():
+        return
+    payload = [byte for byte in text.encode("ascii", "ignore") if 0x20 <= byte <= 0x7E]
+    prefix = list(_config["sysex_prefix"])
+    color = int(color) & 0x7F
+    loop_byte = 0x01 if loop else 0x00
+    if _config["mode"] == "lp3":
+        # MK3: loop, speed, then a palette colourspec (type 0 + index).
+        data = prefix + [
+            LP3_SYSEX_SCROLL,
+            loop_byte,
+            LP3_SCROLL_SPEED,
+            0x00, color,
+        ] + payload + [0xF7]
+    else:
+        data = prefix + [SYSEX_SCROLL, color, loop_byte] + payload + [0xF7]
+    device.midiOutSysex(_sysex_bytes(data))
+
+def stop_scroll() -> None:
+    """Stop any in-progress scroll by sending the empty scroll command.
+
+    A no-op on surfaces without native scroll.  Note the hardware does NOT
+    repaint the grid afterwards, so callers must follow this with a cache
+    invalidation + full refresh if a looping scroll might have been running.
+    """
+    if not supports_text_scroll():
+        return
+    command = LP3_SYSEX_SCROLL if _config["mode"] == "lp3" else SYSEX_SCROLL
+    data = list(_config["sysex_prefix"]) + [command, 0xF7]
+    device.midiOutSysex(_sysex_bytes(data))
+
 def clear_surface(grid_led_cache: dict, top_led_cache: dict) -> None:
     """Blank every pad and CC LED; flush both caches."""
     if _config["mode"] == "mk1":
-        # MK1: individual note-on messages, velocity=12 (red=0,green=0,flags=12=off).
-        for pad in PLAYABLE_PADS:
-            device.midiOutMsg(midi.MIDI_NOTEON, SESSION_CHANNEL, pad_to_mk1_note(pad), 12)
-        for cc in _config["top_ccs"]:
-            device.midiOutMsg(midi.MIDI_CONTROLCHANGE, SESSION_CHANNEL, cc, 12)
+        # MK1/S reset command: all LEDs off, layout defaults restored.
+        device.midiOutMsg(midi.MIDI_CONTROLCHANGE, SESSION_CHANNEL, 0, 0)
     elif _config["mode"] != "lp3":
         data = list(_config["sysex_prefix"]) + [SYSEX_LIGHT_ALL, 0x00, 0xF7]
         device.midiOutSysex(_sysex_bytes(data))
@@ -164,6 +221,12 @@ def _mk1_velocity_for(color: int, rgb_color: tuple[int, int, int] | None, mk1: i
         red, green, _blue = rgb_color
         return mk1_velocity_from_rgb(red, green, maximum=rgb_max_value())
     return _mk1_velocity(color)
+
+def _mk1_ignore_velocity_for(color: int, rgb_color: tuple[int, int, int] | None, mk1: int | None) -> int:
+    return _mk1_velocity_for(color, rgb_color, mk1) & 0x33
+
+def _send_mk1_buffer_mode(value: int) -> None:
+    device.midiOutMsg(midi.MIDI_CONTROLCHANGE, SESSION_CHANNEL, 0, int(value) & 0x7F)
 
 def send_grid_led_fallback(
     pad: int,
@@ -222,6 +285,20 @@ def send_top_led_rgb(cc: int, rgb: tuple[int, int, int]) -> None:
     message = list(_config["sysex_prefix"]) + [SYSEX_LED_SET_RGB, cc, r, g, b, 0xF7]
     device.midiOutSysex(_sysex_bytes(message))
 
+def send_top_led_mk1_pulse(cc: int, rgb: tuple[int, int, int]) -> None:
+    """Software-pulse a top-row CC LED (MK1 only).
+
+    MK1 has no SysEx LED commands, so the pulse brightness is folded down to
+    a red/green velocity (same pipeline as indexed pads) and sent as a CC
+    message each frame.
+    """
+    if _config["mode"] != "mk1":
+        return
+    red, green, blue = rgb
+    tuned_r, tuned_g, _tuned_b = rgb6_from_rgb(red, green, blue)
+    velocity = mk1_velocity_from_rgb(tuned_r, tuned_g, maximum=rgb_max_value())
+    device.midiOutMsg(midi.MIDI_CONTROLCHANGE, SESSION_CHANNEL, cc, velocity)
+
 def _as_led_color(value) -> LedColor:
     """Normalise a lighting-fn return into a LedColor.
 
@@ -257,6 +334,8 @@ def refresh_surface(
     """
     pairs: list[int] = []
     rgb_entries: list[int] = []
+    mk1_grid_entries: list[tuple[int, LedColor]] = []
+    mk1_top_entries: list[tuple[int, LedColor]] = []
     for pad in PLAYABLE_PADS:
         if pulse_grid_pads and pad in pulse_grid_pads:
             grid_led_cache.pop(pad, None)
@@ -265,14 +344,14 @@ def refresh_surface(
         if grid_led_cache.get(pad) == led:
             continue
         grid_led_cache[pad] = led
+        if _config["mode"] == "mk1":
+            mk1_grid_entries.append((pad, led))
+            continue
         palette_color, rgb_color = led.index, led.rgb
-        # For RGB pads on MK2/LP3 the batched RGB sysex (flushed once after the
-        # loop) is the authoritative update.  Sending the per-pad palette
-        # approximation first paints a brighter, wrong colour that the RGB batch
-        # then overwrites — on MK2 that interim shows as a one-frame flash across
-        # a freshly-scrolled grid.  Only MK1 (no sysex) needs the RGB fallback.
-        if rgb_color is None or _config["mode"] == "mk1":
-            send_grid_led_fallback(pad, fallback_palette(palette_color, rgb_color), rgb_color, led.mk1)
+        # MK2/LP3 light every LED through the batched SysEx (flushed once after
+        # the loop), which addresses pads by Session-layout index regardless of
+        # the active layout or channel — so no per-pad note/CC fallback is
+        # needed.  (The MK1 branch above handles MK1, which has no SysEx.)
         if rgb_color is not None:
             if _config["mode"] == "lp3":
                 rgb_entries.extend(_lp3_colorspec(pad, palette_color, rgb_color))
@@ -292,14 +371,43 @@ def refresh_surface(
         if top_led_cache.get(cc) == led:
             continue
         top_led_cache[cc] = led
+        if _config["mode"] == "mk1":
+            mk1_top_entries.append((cc, led))
+            continue
         color = led.index
-        send_top_led_fallback(cc, color, led.mk1)
         if _config["mode"] == "lp3":
             pairs.extend(_lp3_colorspec(cc, color, None))
         else:
             pairs.extend((cc, color))
-    # MK1 has no SysEx LED commands; all output already went through send_grid_led_fallback above.
     if _config["mode"] == "mk1":
+        total = len(mk1_grid_entries) + len(mk1_top_entries)
+        if total <= 0:
+            return
+        if _config["mk1_double_buffer"] and total >= _config["mk1_double_buffer_threshold"]:
+            # Launchpad S: stage a large frame invisibly, swap, then return to
+            # simple mode so one-off pad updates still light immediately.
+            _send_mk1_buffer_mode(0x34)
+            for pad, led in mk1_grid_entries:
+                device.midiOutMsg(
+                    midi.MIDI_NOTEON,
+                    SESSION_CHANNEL,
+                    pad_to_mk1_note(pad),
+                    _mk1_ignore_velocity_for(led.index, led.rgb, led.mk1),
+                )
+            for cc, led in mk1_top_entries:
+                device.midiOutMsg(
+                    midi.MIDI_CONTROLCHANGE,
+                    SESSION_CHANNEL,
+                    cc,
+                    _mk1_ignore_velocity_for(led.index, led.rgb, led.mk1),
+                )
+            _send_mk1_buffer_mode(0x31)
+            _send_mk1_buffer_mode(0x20)
+            return
+        for pad, led in mk1_grid_entries:
+            send_grid_led_fallback(pad, fallback_palette(led.index, led.rgb), led.rgb, led.mk1)
+        for cc, led in mk1_top_entries:
+            send_top_led_fallback(cc, led.index, led.mk1)
         return
     if pairs:
         if _config["mode"] == "lp3":
@@ -325,10 +433,12 @@ def refresh_grid_pad(
         return
     grid_led_cache[pad] = led
     palette_color, rgb_color = led.index, led.rgb
-    fallback_color = fallback_palette(palette_color, rgb_color)
-    send_grid_led_fallback(pad, fallback_color, rgb_color, led.mk1)
-    # MK1 has no SysEx LED commands; fallback already sent the note-on.
+    # MK1 has no SysEx LED commands, so the note-on fallback is the only way to
+    # light the pad.  MK2/LP3 light it through SysEx below, which addresses the
+    # pad by index regardless of layout/channel — no fallback needed.
     if _config["mode"] == "mk1":
+        fallback_color = fallback_palette(palette_color, rgb_color)
+        send_grid_led_fallback(pad, fallback_color, rgb_color, led.mk1)
         return
     if _config["mode"] == "lp3":
         message = list(_config["sysex_prefix"]) + [_config["lp3_led_command"]] + _lp3_colorspec(
@@ -349,6 +459,50 @@ def refresh_grid_pad(
             0xF7,
     ]
     device.midiOutSysex(_sysex_bytes(message))
+
+def refresh_grid_pads(
+    pads,
+    grid_lighting_fn,
+    grid_led_cache: dict,
+) -> None:
+    """Refresh multiple grid pads, flushing them as one SysEx batch when possible."""
+    if _config["mode"] == "mk1":
+        for pad in pads:
+            refresh_grid_pad(pad, grid_lighting_fn, grid_led_cache)
+        return
+    pairs: list[int] = []
+    rgb_entries: list[int] = []
+    for pad in pads:
+        led = _as_led_color(grid_lighting_fn(pad))
+        if grid_led_cache.get(pad) == led:
+            continue
+        grid_led_cache[pad] = led
+        palette_color, rgb_color = led.index, led.rgb
+        if _config["mode"] == "lp3":
+            entry = _lp3_colorspec(pad, palette_color, rgb_color)
+            if rgb_color is None:
+                pairs.extend(entry)
+            else:
+                rgb_entries.extend(entry)
+            continue
+        fallback_color = fallback_palette(palette_color, rgb_color)
+        if rgb_color is None:
+            pairs.extend((pad, fallback_color))
+        else:
+            red, green, blue = rgb_color
+            rgb_entries.extend((pad, red, green, blue))
+    if pairs:
+        if _config["mode"] == "lp3":
+            message = list(_config["sysex_prefix"]) + [_config["lp3_led_command"]] + pairs + [0xF7]
+        else:
+            message = list(_config["sysex_prefix"]) + [SYSEX_LED_SET] + pairs + [0xF7]
+        device.midiOutSysex(_sysex_bytes(message))
+    if rgb_entries:
+        if _config["mode"] == "lp3":
+            message = list(_config["sysex_prefix"]) + [_config["lp3_led_command"]] + rgb_entries + [0xF7]
+        else:
+            message = list(_config["sysex_prefix"]) + [SYSEX_LED_SET_RGB] + rgb_entries + [0xF7]
+        device.midiOutSysex(_sysex_bytes(message))
 
 # Colour utilities
 def fallback_palette(
@@ -454,3 +608,4 @@ def rgb6_from_color(
         saturation=saturation,
         gamma=gamma,
     )
+# ~gargoyles rule~

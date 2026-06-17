@@ -458,4 +458,339 @@ def load_live_then_static(script_dir: Path, live_slots: set[int] | None = None) 
         slot = next_slot + offset
         modes_by_slot[slot] = mode.with_slot(slot)
     return [modes_by_slot[slot] for slot in range(_MAX_TOTAL_SLOTS) if slot in modes_by_slot]
-# gargoyles rule
+
+# Runtime helpers used by LaunchpadSurface.
+import time
+
+from fl_stubs import channels, device
+import channel_lock as cl
+import led_display
+import modulators as ps
+from modulators import PadFader
+from constants import LP3_MENU_INACTIVE, PAD_DISABLED, LedColor
+from device_profile import DEVICE_FAMILY_LPM3, DEVICE_FAMILY_LPX
+
+LPX_CUSTOM_MODE_PRODUCT_ID = 0x0C
+LPM3_CUSTOM_MODE_PRODUCT_ID = 0x0D
+LPX_CUSTOM_MODE_SLOT_IDS = (4, 5, 6, 7, 8, 9, 10, 11)
+LPM3_CUSTOM_MODE_LAYOUT_IDS = (4, 5, 6, 7, 8, 9, 10, 11)
+CUSTOM_MODE_READ_TIMEOUT_SECONDS = 1.5
+CUSTOM_FADER_MICRO_BRIGHTNESS = (0.25, 0.5, 0.75, 1.0)
+
+
+def prepare_runtime(surface, log) -> None:
+    if surface.device_family in (DEVICE_FAMILY_LPX, DEVICE_FAMILY_LPM3):
+        live_ready = True
+        try:
+            reset_live_folder(surface.script_dir)
+        except Exception as exc:
+            live_ready = False
+            log(f"custom modes live reset failed: {exc}")
+        surface._live_custom_mode_slots.clear()
+        if live_ready:
+            start_live_read(surface, log)
+        else:
+            surface._live_custom_mode_reading = False
+        reload_runtime(surface, live_first=True, log=log)
+    else:
+        surface._live_custom_mode_reading = False
+        surface._live_custom_mode_slots.clear()
+        reload_runtime(surface, live_first=False, log=log)
+
+
+def reload_runtime(surface, *, live_first: bool, log) -> None:
+    surface._custom_modes = (
+        load_live_then_static(surface.script_dir, surface._live_custom_mode_slots)
+        if live_first
+        else load_from_script_dir(surface.script_dir)
+    )
+    surface._custom_fader_helpers = {
+        (mode.slot, fader.fader_index): PadFader(
+            fader.pads(),
+            minimum=0.0,
+            maximum=float(fader.max_value),
+            bipolar=fader.bipolar,
+            interpolate_seconds=0.0,
+        )
+        for mode in surface._custom_modes
+        for fader in mode.faders
+    }
+    if surface._custom_modes:
+        surface._custom_mode_index = max(0, min(surface._custom_mode_index, len(surface._custom_modes) - 1))
+    else:
+        surface._custom_mode_index = 0
+    source = "live/static syx" if live_first else "static syx"
+    log(f"loaded {len(surface._custom_modes)} custom mode(s) from {source}")
+
+
+def product_id(device_family: str) -> int | None:
+    if device_family == DEVICE_FAMILY_LPX:
+        return LPX_CUSTOM_MODE_PRODUCT_ID
+    if device_family == DEVICE_FAMILY_LPM3:
+        return LPM3_CUSTOM_MODE_PRODUCT_ID
+    return None
+
+
+def slot_ids(device_family: str) -> tuple[int, ...]:
+    if device_family == DEVICE_FAMILY_LPX:
+        return LPX_CUSTOM_MODE_SLOT_IDS
+    if device_family == DEVICE_FAMILY_LPM3:
+        return LPM3_CUSTOM_MODE_LAYOUT_IDS
+    return ()
+
+
+def read_request(device_family: str, slot_id: int) -> bytes | None:
+    pid = product_id(device_family)
+    if pid is None:
+        return None
+    if device_family == DEVICE_FAMILY_LPM3:
+        return bytes((0xF0, 0x00, 0x20, 0x29, 0x02, pid, 0x05, 0x01, slot_id, 0xF7))
+    return bytes((
+        0xF0, 0x00, 0x20, 0x29, 0x02, pid,
+        0x20, 0x00, 0x40, 0x40, slot_id, 0xF7,
+    ))
+
+
+def start_live_read(surface, log) -> None:
+    if product_id(surface.device_family) is None:
+        return
+    ids = slot_ids(surface.device_family)
+    if not ids:
+        return
+    surface._live_custom_mode_reading = True
+    surface._live_custom_mode_deadline = time.monotonic() + CUSTOM_MODE_READ_TIMEOUT_SECONDS
+    for slot_id in ids:
+        request = read_request(surface.device_family, slot_id)
+        if request is None:
+            continue
+        try:
+            device.midiOutSysex(request)
+        except Exception as exc:
+            log(f"custom mode slot id {slot_id} read request failed: {exc}")
+    log(f"requested {len(ids)} on-device custom mode slot id(s) from {surface.device_label}")
+
+
+def complete_live_read_if_due(surface, log) -> None:
+    if not surface._live_custom_mode_reading or time.monotonic() < surface._live_custom_mode_deadline:
+        return
+    surface._live_custom_mode_reading = False
+    log(
+        "custom modes live read complete: "
+        f"{len(surface._live_custom_mode_slots)} device slot(s), {len(surface._custom_modes)} total loaded"
+    )
+    if surface._pending_custom_mode_index is not None and surface._custom_modes:
+        surface._custom_mode_index = max(0, min(len(surface._custom_modes) - 1, surface._pending_custom_mode_index))
+        surface._pending_custom_mode_index = None
+        surface._refresh_needed = True
+
+
+def handle_sysex(surface, event, log) -> None:
+    sysex = event_sysex_bytes(event)
+    reply = reply_slot(surface.device_family, sysex)
+    if reply is None:
+        return
+    slot, slot_id = reply
+    parsed_modes = parse_syx_bytes(sysex)
+    mode = parsed_modes[0] if parsed_modes else None
+    if mode is None or (len(mode) == 0 and not mode.faders):
+        log(f"custom mode slot id {slot_id} reply was empty; keeping fallback slot")
+        return
+    try:
+        write_live_slot(surface.script_dir, slot, sysex)
+    except Exception as exc:
+        log(f"custom mode slot id {slot_id} live write failed: {exc}")
+        return
+    if slot not in surface._live_custom_mode_slots:
+        surface._live_custom_mode_slots.add(slot)
+        log(
+            f"loaded live custom mode slot {slot + 1} "
+            f"(id {slot_id}): {mode.name or '(unnamed)'}"
+        )
+    reload_runtime(surface, live_first=True, log=log)
+    surface._refresh_needed = True
+
+
+def event_sysex_bytes(event) -> bytes:
+    try:
+        return bytes(int(value) & 0xFF for value in event.sysex)
+    except Exception:
+        return b""
+
+
+def reply_slot(device_family: str, sysex: bytes) -> tuple[int, int] | None:
+    pid = product_id(device_family)
+    ids = slot_ids(device_family)
+    if pid is None or not ids or len(sysex) < 12:
+        return None
+    if sysex[0] != 0xF0 or sysex[-1] != 0xF7:
+        return None
+    if device_family == DEVICE_FAMILY_LPM3:
+        if sysex[:8] != bytes((0xF0, 0x00, 0x20, 0x29, 0x02, pid, 0x05, 0x01)):
+            return None
+        slot_id = sysex[8] & 0x7F
+    else:
+        if sysex[1:8] != bytes((0x00, 0x20, 0x29, 0x02, pid, 0x20, 0x00)):
+            return None
+        if sysex[9] != 0x40:
+            return None
+        slot_id = sysex[10] & 0x7F
+    try:
+        slot = ids.index(slot_id)
+    except ValueError:
+        return None
+    return slot, slot_id
+
+
+def index_for_selector_slot(surface, slot: int) -> int | None:
+    n_slots = len(ps.SELECTOR_PADS)
+    if not 0 <= slot < n_slots:
+        return None
+    upper_slot = slot + n_slots
+    if (
+        surface._custom_mode_index % n_slots == slot
+        and upper_slot < len(surface._custom_modes)
+    ):
+        if surface._custom_mode_index == slot:
+            return upper_slot
+        return slot
+    if slot < len(surface._custom_modes):
+        return slot
+    return None
+
+
+def handle_pad(surface, event, pad: int, velocity: int, pressed: bool) -> bool:
+    slot = ps.pad_to_slot(pad)
+    if slot is not None:
+        if pressed:
+            mode_index = index_for_selector_slot(surface, slot)
+            if mode_index is not None:
+                surface._custom_mode_index = mode_index
+                surface._custom_mode_selecting = True
+                surface._refresh_surface()
+                surface._save_state()
+        return True
+    mode = surface._active_custom_mode()
+    if mode is None:
+        return True
+    fader = mode.fader_for_pad(pad)
+    if fader is not None and pressed:
+        return handle_fader_pad(surface, event, pad, fader, mode.slot)
+    cp = mode.pad(pad)
+    if cp is None or cp.is_off:
+        return True
+    if cp.is_note and cl.is_locked(surface.state, surface._lock_context()):
+        return handle_locked_note(surface, pad, cp, velocity, pressed)
+    channel = cp.resolved_channel(int(surface.state.get("midi_channel", 0))) & 0x0F
+    if cp.is_note:
+        if pressed:
+            vel = max(1, velocity or cp.on_value or 100)
+            event.status = 0x90 | channel
+            event.data1 = cp.control_value
+            event.data2 = vel
+            surface.active_pads[pad] = (channel, cp.control_value)
+        else:
+            info = surface.active_pads.pop(pad, None)
+            ch, note = info if info is not None else (channel, cp.control_value)
+            event.status = 0x80 | ch
+            event.data1 = note
+            event.data2 = 0
+    elif cp.is_cc:
+        val = cp.on_value if pressed else cp.off_value
+        event.status = 0xB0 | channel
+        event.data1 = cp.control_value
+        event.data2 = val
+    else:
+        led_display.refresh_grid_pad(pad, surface._grid_lighting, surface._grid_led_cache)
+        return True
+    led_display.refresh_grid_pad(pad, surface._grid_lighting, surface._grid_led_cache)
+    return False
+
+
+def handle_locked_note(surface, pad: int, cp, velocity: int, pressed: bool) -> bool:
+    midi_channel = int(surface.state["midi_channel"]) & 0x0F
+    note = cp.control_value
+    if pressed:
+        target = cl.get(surface.state, surface._lock_context())
+        vel = max(1, velocity or cp.on_value or 100)
+        surface.active_pads[pad] = (target, note)
+        key = (target, note)
+        surface.active_notes[key] = surface.active_notes.get(key, 0) + 1
+        channels.midiNoteOn(target, note, vel, midi_channel)
+    else:
+        info = surface.active_pads.pop(pad, None)
+        if info is not None:
+            target, note = info
+            surface._drop_active_note(target, note)
+            channels.midiNoteOn(target, note, 0, midi_channel)
+    led_display.refresh_grid_pad(pad, surface._grid_lighting, surface._grid_led_cache)
+    surface._refresh_needed = True
+    return True
+
+
+def handle_fader_pad(surface, event, pad: int, fader: CustomFader, slot: int) -> bool:
+    key = (slot, fader.fader_index)
+    pf = surface._custom_fader_helpers.get(key)
+    if pf is None:
+        return True
+    current = surface._custom_fader_values.get(key, 0.0)
+    new_value = pf.next_value_for_pad(pad, current)
+    surface._custom_fader_values[key] = new_value
+    cc_val = max(0, min(127, int(round(new_value))))
+    channel = fader.resolved_channel(int(surface.state.get("midi_channel", 0))) & 0x0F
+    event.status = 0xB0 | channel
+    event.data1 = fader.cc_number
+    event.data2 = cc_val
+    surface._refresh_grid_pads(fader.pads())
+    return False
+
+
+def slot_display_index(surface, slot: int) -> int | None:
+    n_slots = len(ps.SELECTOR_PADS)
+    if not (0 <= slot < len(surface._custom_modes)):
+        return None
+    if surface._custom_mode_index % n_slots == slot:
+        return surface._custom_mode_index
+    return slot
+
+
+def locked_selector_pads(surface) -> set[int]:
+    pads: set[int] = set()
+    for slot, pad in enumerate(ps.SELECTOR_PADS):
+        display_index = slot_display_index(surface, slot)
+        if display_index is None:
+            continue
+        idx = min(display_index, len(surface._custom_modes) - 1)
+        if cl.is_locked(surface.state, cl.custom_context(idx)):
+            pads.add(pad)
+    return pads
+
+
+def lighting(surface, pad: int) -> LedColor:
+    slot = ps.pad_to_slot(pad)
+    if slot is not None:
+        display_index = slot_display_index(surface, slot)
+        if display_index is None:
+            return LedColor(PAD_DISABLED)
+        n_slots = len(ps.SELECTOR_PADS)
+        mode = surface._custom_modes[min(display_index, len(surface._custom_modes) - 1)]
+        active = surface._custom_mode_index % n_slots == slot
+        color = mode.on_color if active else LP3_MENU_INACTIVE
+        return LedColor(color)
+    mode = surface._active_custom_mode()
+    if mode is None:
+        return LedColor(PAD_DISABLED)
+    fader = mode.fader_for_pad(pad)
+    if fader is not None:
+        key = (mode.slot, fader.fader_index)
+        pf = surface._custom_fader_helpers.get(key)
+        if pf is None:
+            return LedColor(PAD_DISABLED)
+        current = surface._custom_fader_values.get(key, 0.0)
+        return surface._fader_pad_lighting(pf, fader.on_color, fader.off_color, pad, current)
+    cp = mode.pad(pad)
+    if cp is None or cp.is_off:
+        return LedColor(PAD_DISABLED)
+    if pad in surface.active_pads:
+        return LedColor(mode.on_color)
+    return LedColor(cp.off_color)
+# ~gargoyles rule~

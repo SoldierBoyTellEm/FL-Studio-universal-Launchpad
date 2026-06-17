@@ -1,4 +1,4 @@
-# constants.py
+ # constants.py
 # Every magic number, colour constant, pad layout, and default state value
 # used across the script lives here.  Import with `from constants import *`
 # or name-specifically; nothing in this file has side-effects.
@@ -169,6 +169,16 @@ SYSEX_LED_SET   = 0x0A
 SYSEX_LED_SET_RGB = 0x0B
 SYSEX_LED_PULSE = 0x28
 SYSEX_LIGHT_ALL = 0x0E
+SYSEX_SCROLL    = 0x14
+# MK3 family (LPX / Mini MK3) uses a different scroll command and payload:
+#   prefix + 07h + <loop> + <speed> + <colourspec> + <text> + F7
+# (vs MK2's prefix + 14h + <colour> + <loop> + <text> + F7).
+LP3_SYSEX_SCROLL = 0x07
+# Default MK3 scroll speed in pads/second (MK2 has no speed byte).
+LP3_SCROLL_SPEED = 0x07
+# Palette colour for the "FPC" placeholder scroll. MUST be non-zero —
+# scroll colour 0 is "off", which scrolls the text invisibly. 0x03 is white.
+FPC_SCROLL_COLOR = 0x03
 SYSEX_LAYOUT    = 0x22
 # Top-row CC numbers
 TOP_CC_START    = 104
@@ -199,17 +209,33 @@ XY_PAD_Y_CC = 103
 # Fader page CCs: 8 vertical (col 0-7) and 8 horizontal (col 0-7)
 XY_VERT_FADER_CCS  = tuple(range(104, 112))   # 104–111
 XY_HORIZ_FADER_CCS = tuple(range(112, 120))   # 112–119
+# Bipolar fader page CCs. 102-119 (the rest of the undefined high CC block) is
+# fully used above, so these draw from the next-best undefined range: 20-31
+# (undefined continuous controllers) plus 32-35 (LSB companions of bank-select/
+# mod-wheel/breath/CC3, inert unless 14-bit MSB+LSB pairing is in use).
+XY_VERT_BIPOLAR_FADER_CCS  = tuple(range(20, 28))   # 20–27
+XY_HORIZ_BIPOLAR_FADER_CCS = tuple(range(28, 36))   # 28–35
 # Mod-wheel CC (standard MIDI CC 1)
 performance_modwheel_CC = 1
 # XY pad sub-page indices
-XY_PAGE_XY      = 0
-XY_PAGE_VERT    = 1
-XY_PAGE_HORIZ   = 2
-XY_PAGE_COUNT   = 3
+XY_PAGE_XY            = 0
+XY_PAGE_VERT          = 1
+XY_PAGE_HORIZ         = 2
+XY_PAGE_VERT_BIPOLAR  = 3
+XY_PAGE_HORIZ_BIPOLAR = 4
+XY_PAGE_COUNT         = 5
 # XY fader lighting (palette indices; micro-brightness applied via dim_palette_rgb)
 XY_FADER_ON_COLOR   = 0x1C   # filled steps
 XY_FADER_OFF_COLOR  = 0x01   # active-step dim track
 performance_modwheel_COLOR   = 0x25   # modwheel column fill
+
+# PadFader microstepping
+FADER_MICROVALUES_PER_PAD = 4   # microsteps within a single pad's range
+FADER_DEFAULT_MICROVALUE  = 0   # microstep selected when a press moves to a new pad/group
+# Default time a PadFader takes to glide from its previous value to a newly
+# pressed value, avoiding instant jumps. Pass interpolate_seconds=0 to a
+# PadFader to disable this for that fader.
+FADER_DEFAULT_INTERPOLATE_SECONDS = 0.1
 
 # Surface mode names
 MODE_NOTE        = "note"
@@ -224,8 +250,10 @@ MODE_BLANK       = "blank"
 LOWEST_NOTE               = 0
 HIGHEST_NOTE              = 131
 TAP_AND_HOLD_DURATION_SECONDS = 0.4
-NOTE_DOUBLE_TAP_SECONDS       = 0.35
 PERFORMANCE_DOUBLE_TAP_SECONDS = 0.35
+# Window within which pressing both centre pads of a bipolar fader counts as
+# "at once" and resets the fader to centre, regardless of press/release order.
+XY_BIPOLAR_CENTER_CHORD_SECONDS = 0.2
 # Performance-mode geometry
 PERFORMANCE_PAGE_WIDTH   = 8
 PERFORMANCE_PAGE_HEIGHT  = 8
@@ -239,6 +267,11 @@ PERFORMANCE_LAUNCH_MAP_NAME = "Novation Launchpad"
 STEP_SEQUENCER_WIDTH = 9
 STEP_SEQUENCER_HEIGHT = 8
 STEP_SEQUENCER_MAX_STEPS = 128
+# Step-sequencer settings pane (long-hold the FPC/step-seq key while in Step
+# Sequencer mode). Top-left pad toggles the dual-page split: the bottom four
+# rows become a second step page for the top four channels instead of
+# channels 5-8.
+STEP_SEQ_DUAL_PAGE_SETTING_PAD = 81
 # Playlist / channel type IDs
 CHANNEL_TYPE_AUDIO_CLIP = 4
 WID_PLAYLIST            = 2
@@ -267,9 +300,9 @@ CHANNEL_RACK_COLOR_SATURATION_LP3 = 1.3
 CHANNEL_RACK_COLOR_GAMMA_LP3      = 1
 # Channel-rack tick dimming divisors (higher = dimmer; each RGB component is
 # integer-divided by the value, floored at 1).
-CHANNEL_RACK_DIM_INACTIVE_STEP    = 4   # off step on an unmuted channel
-CHANNEL_RACK_DIM_MUTED_STEP       = 6   # step on a muted channel
-CHANNEL_RACK_DIM_MUTED_TOGGLE     = 6  # channel toggle pad on a muted channel
+CHANNEL_RACK_DIM_INACTIVE_STEP    = 10  # off step on an unmuted channel
+CHANNEL_RACK_DIM_MUTED_STEP       = 75   # step on a muted channel
+CHANNEL_RACK_DIM_MUTED_TOGGLE     = 7   # channel toggle pad on a muted channel
 CHANNEL_RACK_DIM_PLAYHEAD_STEP    = 0.5  # step under the playhead while playing (<1 brightens)
 # Pad groups
 SETTINGS_GRID_PADS = tuple(
@@ -278,6 +311,10 @@ SETTINGS_GRID_PADS = tuple(
     for col in range(1, 9)
 )
 SIDE_COLUMN_PADS = tuple(row * 10 + 9 for row in range(1, 9))
+
+# Note mode: top row (81-88) plus its side-column pad (89) as a 9-wide
+# modwheel fader, left to right, toggled by MODWHEEL_ROW_SETTING_PAD.
+NOTE_TOP_ROW_MODWHEEL_PADS = tuple(range(81, 90))
 
 # Right-column pads used as custom-mode slot selectors (top=slot 0, bottom=slot 7)
 CUSTOM_MODE_SELECTOR_PADS = tuple(row * 10 + 9 for row in range(8, 0, -1))
@@ -378,6 +415,9 @@ LP3_STEP_ON         = 0x34
 LP3_STEP_SELECTED   = 0x1C
 # Full-brightness 6-bit RGB for the channel-lock pulse on the Note key (#e530ff).
 NOTE_LOCK_PULSE_RGB = (57, 12, 63)
+# Same colour (#e530ff) as 8-bit RGB, for MK1's velocity-pulse pipeline
+# (rgb6_from_rgb expects 0-255 input and rescales internally).
+NOTE_LOCK_PULSE_RGB_8BIT = (0xE5, 0x30, 0xFF)
 # FL Studio's default channel colour (warm tan) — used to detect unset channels
 # and substitute white instead of rendering the bland default.
 DEFAULT_FL_CHANNEL_RGB = (0xA5, 0x95, 0x78)
@@ -436,6 +476,7 @@ DEFAULT_STATE = {
     "row_stride": 5,
     "base_octave": 2,
     "axis_flip": False,
+    "note_top_row_modwheel": False,
     "midi_channel": 0,
     "locked_channel": -1,
     "channel_locks": {},
@@ -445,6 +486,7 @@ DEFAULT_STATE = {
     "performance_direct_audio": False,
     "step_channel_offset": 0,
     "step_offset": 0,
+    "step_dual_page": False,
     "lights_out": False,
     "gross_beat_slot_mode": "time",
     "fpc_page": 0,
@@ -469,10 +511,15 @@ OVERLAP_SETTING_PADS = {
 }
 AXIS_SETTING_PAD     = 87
 CHROMATIC_SETTING_PAD = 88
+MODWHEEL_ROW_SETTING_PAD = 85
+NOTE_ROUTING_SETTING_PAD = 69
+# First two pads on the left of the settings grid's top row.
+SMALL_AXIS_INVERT_SETTING_PAD = 81
+LARGE_AXIS_INVERT_SETTING_PAD = 82
 INACTIVE_SETTINGS_PADS = {
     61, 64, 68,
     58,
-    81, 82, 83, 84, 85, 86,
+    83, 84, 86,
 }
 ROOT_SETTING_PADS = {
     62: 1,  63: 3,  65: 6,  66: 8,  67: 10,

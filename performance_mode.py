@@ -373,4 +373,4 @@ def performance_arrow_color(remaining_steps: int, surface_mode: str) -> int:
     if remaining_steps <= 0:
         return LP3_ARROW_INACTIVE
     return min(0x7F, LP3_PERFORMANCE_READY + max(0, 4 - remaining_steps))
-# gargoyles rule
+# ~gargoyles rule~

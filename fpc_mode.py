@@ -520,4 +520,4 @@ def fpc_note_for_pad(pad: int, state: dict, selected_channel_fn, page_index: int
         return -1
     channel_index, pad_index = assignment
     return fpc_pad_note(channel_index, pad_index)
-# gargoyles rule
+# ~gargoyles rule~

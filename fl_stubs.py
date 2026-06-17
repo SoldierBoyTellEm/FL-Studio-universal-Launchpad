@@ -48,6 +48,24 @@ except ImportError:  # Local editing fallback outside FL Studio.
         def setGridBit(self, *args):
             return None
 
+        def getChannelVolume(self, *args):
+            return 0.8
+
+        def setChannelVolume(self, *args):
+            return None
+
+        def getChannelPan(self, *args):
+            return 0.0
+
+        def setChannelPan(self, *args):
+            return None
+
+        def getStepParameterByIndex(self, *args):
+            return 100
+
+        def setStepParameterByIndex(self, *args):
+            return None
+
         def midiNoteOn(self, *args):
             return None
 
@@ -109,6 +127,7 @@ except ImportError:  # Local editing fallback outside FL Studio.
         MaxInt = 2147483647
         HW_Dirty_LEDs = 256
         PME_System = 2
+        FPT_Play = 10
         FPT_Record = 12
         GC_Semitone = 1
 
@@ -181,7 +200,8 @@ except ImportError:  # Local editing fallback outside FL Studio.
             return None
 
     class _DummyPatterns:
-        pass
+        def patternNumber(self, *args):
+            return 1
 
     class _DummyLaunchMapPages:
         def createOverlayMap(self, *_args):
@@ -239,3 +259,4 @@ except ImportError:  # Local editing fallback outside FL Studio.
     plugins = _DummyPlugins()
     transport = _DummyTransport()
     ui = _DummyUi()
+# ~gargoyles rule~

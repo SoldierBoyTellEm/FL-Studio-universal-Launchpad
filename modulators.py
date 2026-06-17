@@ -8,6 +8,7 @@
 #   selector_lighting() / handle_press() / step_page() – page selector helpers
 #   pad_to_xy()    – XY grid hit-test (excludes side column)
 #   vert_fader_defs() / horiz_fader_defs() / modwheel_pads() – CC-layout tables
+#   vert_bipolar_fader_defs() / horiz_bipolar_fader_defs() – bipolar CC-layout tables
 #   xy_values()    – position → CC pair
 #   xy_grid_lighting() – crosshair display for the positional XY page
 #   grid_fader_cc() – which CC a grid pad drives on a fader page
@@ -24,9 +25,17 @@ from constants import (
     XY_PAD_Y_CC,
     XY_VERT_FADER_CCS,
     XY_HORIZ_FADER_CCS,
+    XY_VERT_BIPOLAR_FADER_CCS,
+    XY_HORIZ_BIPOLAR_FADER_CCS,
     performance_modwheel_CC,
     XY_PAGE_VERT,
     XY_PAGE_HORIZ,
+    XY_PAGE_VERT_BIPOLAR,
+    XY_PAGE_HORIZ_BIPOLAR,
+    FADER_MICROVALUES_PER_PAD,
+    FADER_DEFAULT_MICROVALUE,
+    FADER_DEFAULT_INTERPOLATE_SECONDS,
+    XY_BIPOLAR_CENTER_CHORD_SECONDS,
 )
 
 # PadFader
@@ -45,19 +54,35 @@ class PadFader:
         maximum: float = 1.0,
         bipolar: bool = False,
         tension: float = 0.0,
+        interpolate_seconds: float = FADER_DEFAULT_INTERPOLATE_SECONDS,
     ) -> None:
         self.pads = tuple(pads)
         self.minimum = float(minimum)
         self.maximum = float(maximum)
         self.bipolar = bool(bipolar)
         self.tension = float(tension)
+        self.interpolate_seconds = float(interpolate_seconds)
         self._pad_to_index = {pad: index for index, pad in enumerate(self.pads)}
+        self._center_press_time: dict[int, float] = {}
+        self._ramp_start_value: float | None = None
+        self._ramp_target_value: float | None = None
+        self._ramp_start_time: float = 0.0
 
     def contains(self, pad: int) -> bool:
         return pad in self._pad_to_index
 
     def clamp_value(self, value: float) -> float:
         return _clamp(float(value), self.minimum, self.maximum)
+
+    def center_pads(self) -> tuple[int, ...]:
+        """Return the pad(s) nearest the bipolar centre point: one for an odd
+        pad count, two for an even one."""
+        midpoint = (len(self.pads) - 1) / 2.0
+        return tuple(p for i, p in enumerate(self.pads) if abs(i - midpoint) < 1.0)
+
+    def center_value(self) -> float:
+        """Return the value representing the bipolar centre (zero deviation)."""
+        return (self.minimum + self.maximum) / 2.0
 
     def value_for_pad(self, pad: int) -> float | None:
         """Return the exact fader value that pad's bottom microstep represents, or None."""
@@ -66,8 +91,8 @@ class PadFader:
         pad_index = self._pad_to_index[pad]
         if self.bipolar:
             return None
-        total_steps = len(self.pads) * 4
-        step = pad_index * 4
+        total_steps = len(self.pads) * FADER_MICROVALUES_PER_PAD
+        step = pad_index * FADER_MICROVALUES_PER_PAD
         return self._value_for_unipolar_step(step, total_steps)
 
     def next_value_for_pad(self, pad: int, current_value: float) -> float:
@@ -77,6 +102,72 @@ class PadFader:
         if self.bipolar:
             return self._next_bipolar_value(pad, current_value)
         return self._next_unipolar_value(pad, current_value)
+
+    def apply_press(self, pad: int, current_value: float, now: float) -> float:
+        """Return the value after pressing `pad`, applying the bipolar centre-chord
+        reset: pressing both centre pads within XY_BIPOLAR_CENTER_CHORD_SECONDS of
+        each other resets to centre instead of stepping, regardless of press/release
+        ordering. Unipolar faders and out-of-range pads just step normally.
+
+        Tracks its own press timestamps, so every fader using this gets the
+        chord behaviour for free."""
+        if pad not in self._pad_to_index:
+            return self.clamp_value(current_value)
+        if not self.bipolar:
+            return self.next_value_for_pad(pad, current_value)
+        centers = self.center_pads()
+        if pad not in centers:
+            return self.next_value_for_pad(pad, current_value)
+        other_pads = [p for p in centers if p != pad]
+        if any(
+            now - self._center_press_time.get(p, -1.0) <= XY_BIPOLAR_CENTER_CHORD_SECONDS
+            for p in other_pads
+        ):
+            for p in centers:
+                self._center_press_time.pop(p, None)
+            return self.center_value()
+        self._center_press_time[pad] = now
+        return self.next_value_for_pad(pad, current_value)
+
+    # Interpolation (gliding to a newly pressed value rather than jumping)
+
+    def start_ramp(self, current_value: float, target_value: float, now: float) -> None:
+        """Begin gliding from `current_value` (which may itself be mid-glide —
+        callers should pass current_ramped_value()) to `target_value`. A
+        no-op if interpolate_seconds is 0."""
+        if self.interpolate_seconds <= 0.0:
+            self._ramp_start_value = None
+            self._ramp_target_value = None
+            return
+        self._ramp_start_value = self.clamp_value(current_value)
+        self._ramp_target_value = self.clamp_value(target_value)
+        self._ramp_start_time = now
+
+    def current_ramped_value(self, now: float) -> float | None:
+        """Return the in-progress interpolated value, or None if no ramp is
+        active. Does not clear the ramp — call advance_ramp() to do that."""
+        if self._ramp_target_value is None or self._ramp_start_value is None:
+            return None
+        elapsed = now - self._ramp_start_time
+        duration = self.interpolate_seconds
+        if duration <= 0.0 or elapsed >= duration:
+            return self._ramp_target_value
+        fraction = elapsed / duration
+        return self._ramp_start_value + (self._ramp_target_value - self._ramp_start_value) * fraction
+
+    def advance_ramp(self, now: float) -> float | None:
+        """Return the in-progress interpolated value and clear the ramp once
+        it reaches its target. Returns None if no ramp is active."""
+        value = self.current_ramped_value(now)
+        if value is None:
+            return None
+        if value == self._ramp_target_value:
+            self._ramp_start_value = None
+            self._ramp_target_value = None
+        return value
+
+    def is_ramping(self) -> bool:
+        return self._ramp_target_value is not None
 
     def palette_for_pad(
         self,
@@ -122,14 +213,14 @@ class PadFader:
 
     def _next_unipolar_value(self, pad: int, current_value: float) -> float:
         pad_index = self._pad_to_index[pad]
-        total_steps = len(self.pads) * 4
+        total_steps = len(self.pads) * FADER_MICROVALUES_PER_PAD
         target_group = pad_index
         current_step = self._unipolar_step_for_value(current_value)
-        if current_step // 4 == target_group:
-            micro = (current_step % 4 + 1) % 4
+        if current_step // FADER_MICROVALUES_PER_PAD == target_group:
+            micro = (current_step % FADER_MICROVALUES_PER_PAD + 1) % FADER_MICROVALUES_PER_PAD
         else:
-            micro = 0
-        step = target_group * 4 + micro
+            micro = FADER_DEFAULT_MICROVALUE
+        step = target_group * FADER_MICROVALUES_PER_PAD + micro
         return self._value_for_unipolar_step(step, total_steps)
 
     def _unipolar_palette_for_pad(
@@ -142,8 +233,8 @@ class PadFader:
         off_palette: int,
     ) -> int:
         current_step = self._unipolar_step_for_value(current_value)
-        current_group = current_step // 4
-        current_micro = current_step % 4
+        current_group = current_step // FADER_MICROVALUES_PER_PAD
+        current_micro = current_step % FADER_MICROVALUES_PER_PAD
         pad_index = self._pad_to_index[pad]
         if pad_index < current_group:
             return bright_palettes[-1]
@@ -153,8 +244,8 @@ class PadFader:
 
     def _unipolar_progress_for_pad(self, pad: int, current_value: float) -> tuple[str, int | None]:
         current_step = self._unipolar_step_for_value(current_value)
-        current_group = current_step // 4
-        current_micro = current_step % 4
+        current_group = current_step // FADER_MICROVALUES_PER_PAD
+        current_micro = current_step % FADER_MICROVALUES_PER_PAD
         pad_index = self._pad_to_index[pad]
         if pad_index < current_group:
             return "full", None
@@ -163,7 +254,7 @@ class PadFader:
         return "micro", current_micro
 
     def _unipolar_step_for_value(self, value: float) -> int:
-        total_steps = max(1, len(self.pads) * 4)
+        total_steps = max(1, len(self.pads) * FADER_MICROVALUES_PER_PAD)
         if total_steps == 1:
             return 0
         normalized = (self.clamp_value(value) - self.minimum) / (self.maximum - self.minimum)
@@ -190,11 +281,16 @@ class PadFader:
         current_group, current_micro, current_sign = self._bipolar_state_for_value(current_value)
         sign = -1 if pad_index < midpoint else 1
         if current_group == group and current_sign == sign:
-            micro = (current_micro + 1) % 4
+            micro = (current_micro + 1) % FADER_MICROVALUES_PER_PAD
         else:
-            micro = 0
-        step = group * 4 + micro
-        magnitude = step / float(segments * 4 - 1) if segments > 1 else micro / 3.0
+            micro = FADER_DEFAULT_MICROVALUE
+        # Steps 0..total_steps-1 map to magnitudes (1/total_steps)..1 — the
+        # centre pads' (group 0) microsteps are the smallest non-zero
+        # deviations on their side, never the exact centre. Centre is reached
+        # only via the dedicated centre_value() reset, not by stepping.
+        step = group * FADER_MICROVALUES_PER_PAD + micro
+        total_steps = segments * FADER_MICROVALUES_PER_PAD
+        magnitude = (step + 1) / float(total_steps)
         if sign < 0:
             magnitude *= -1.0
         center = (self.minimum + self.maximum) / 2.0
@@ -254,9 +350,10 @@ class PadFader:
         sign = -1 if normalized < 0.0 else 1
         magnitude = self._inverse_tension(abs(normalized))
         segments = self._bipolar_segments()
-        total_steps = max(1, segments * 4)
-        step = int(round(magnitude * (total_steps - 1)))
-        return step // 4, step % 4, sign
+        total_steps = max(1, segments * FADER_MICROVALUES_PER_PAD)
+        step = int(round(magnitude * total_steps)) - 1
+        step = max(0, min(total_steps - 1, step))
+        return step // FADER_MICROVALUES_PER_PAD, step % FADER_MICROVALUES_PER_PAD, sign
 
     def _bipolar_segments(self) -> int:
         return max(1, len(self.pads) // 2)
@@ -330,23 +427,31 @@ def pad_to_xy(pad: int) -> tuple[int, int] | None:
         return None
     return col, 7 - row
 
+def _vert_fader_pads(col: int) -> tuple[int, ...]:
+    units = col + 1
+    return tuple(row * 10 + units for row in range(1, 9))  # 1x (bottom) … 8x (top)
+
+def _horiz_fader_pads(row: int) -> tuple[int, ...]:
+    tens = 8 - row
+    return tuple(tens * 10 + (col + 1) for col in range(8))  # left … right
+
 def vert_fader_defs() -> tuple[tuple[int, tuple[int, ...]], ...]:
     """One (cc, pads) per column.  Pads ordered bottom→top (low→high value)."""
-    defs = []
-    for col in range(8):
-        units = col + 1
-        pads = tuple(row * 10 + units for row in range(1, 9))  # 1x (bottom) … 8x (top)
-        defs.append((XY_VERT_FADER_CCS[col], pads))
-    return tuple(defs)
+    return tuple((XY_VERT_FADER_CCS[col], _vert_fader_pads(col)) for col in range(8))
 
 def horiz_fader_defs() -> tuple[tuple[int, tuple[int, ...]], ...]:
     """One (cc, pads) per row.  Pads ordered left→right (low→high value)."""
-    defs = []
-    for row in range(8):
-        tens = 8 - row
-        pads = tuple(tens * 10 + (col + 1) for col in range(8))
-        defs.append((XY_HORIZ_FADER_CCS[row], pads))
-    return tuple(defs)
+    return tuple((XY_HORIZ_FADER_CCS[row], _horiz_fader_pads(row)) for row in range(8))
+
+def vert_bipolar_fader_defs() -> tuple[tuple[int, tuple[int, ...]], ...]:
+    """One (cc, pads) per column, bipolar.  Pads ordered bottom→top
+    (negative extreme → centre → positive extreme)."""
+    return tuple((XY_VERT_BIPOLAR_FADER_CCS[col], _vert_fader_pads(col)) for col in range(8))
+
+def horiz_bipolar_fader_defs() -> tuple[tuple[int, tuple[int, ...]], ...]:
+    """One (cc, pads) per row, bipolar.  Pads ordered left→right
+    (negative extreme → centre → positive extreme)."""
+    return tuple((XY_HORIZ_BIPOLAR_FADER_CCS[row], _horiz_fader_pads(row)) for row in range(8))
 
 def modwheel_pads() -> tuple[int, ...]:
     """Side-column pads ordered bottom→top for the modwheel fader."""
@@ -362,6 +467,10 @@ def grid_fader_cc(pad: int, page: int) -> int | None:
         return XY_VERT_FADER_CCS[col]
     if page == XY_PAGE_HORIZ:
         return XY_HORIZ_FADER_CCS[row]
+    if page == XY_PAGE_VERT_BIPOLAR:
+        return XY_VERT_BIPOLAR_FADER_CCS[col]
+    if page == XY_PAGE_HORIZ_BIPOLAR:
+        return XY_HORIZ_BIPOLAR_FADER_CCS[row]
     return None
 
 def xy_values(x: int, y: int) -> tuple[int, int]:
@@ -388,4 +497,4 @@ def xy_grid_lighting(
         if on_col or on_row:
             return LedColor(LP3_MENU_INACTIVE)
     return LedColor(PAD_DISABLED)
-# gargoyles rule
+# ~gargoyles rule~

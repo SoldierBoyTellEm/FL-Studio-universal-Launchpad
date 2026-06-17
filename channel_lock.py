@@ -77,3 +77,4 @@ def migrate_legacy(state: dict) -> None:
         locks = _locks(state)
         locks.setdefault(NOTE_CONTEXT, legacy)
     state["locked_channel"] = -1
+# ~gargoyles rule~

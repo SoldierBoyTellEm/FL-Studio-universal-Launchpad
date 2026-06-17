@@ -13,6 +13,10 @@ from constants import (
     OVERLAP_SETTING_PADS,
     AXIS_SETTING_PAD,
     CHROMATIC_SETTING_PAD,
+    MODWHEEL_ROW_SETTING_PAD,
+    NOTE_ROUTING_SETTING_PAD,
+    SMALL_AXIS_INVERT_SETTING_PAD,
+    LARGE_AXIS_INVERT_SETTING_PAD,
     ROOT_SETTING_PADS,
     SCALE_SETTING_PADS,
     MIDI_CHANNEL_SETTING_PADS,
@@ -76,8 +80,16 @@ def note_for_pad(pad: int, state: dict) -> int:
     row = (pad // 10) - 1
     col = (pad % 10) - 1
     if state["axis_flip"]:
+        if state.get("small_axis_invert", False):
+            row = 7 - row
+        if state.get("large_axis_invert", False):
+            col = 8 - col
         degree_offset = row + (col + int(state["pan_offset"])) * state["row_stride"]
     else:
+        if state.get("small_axis_invert", False):
+            col = 8 - col
+        if state.get("large_axis_invert", False):
+            row = 7 - row
         degree_offset = col + int(state["pan_offset"]) + row * state["row_stride"]
     base_note = 12 * (state["base_octave"] + 2) + state["root"]
     if state["chromatic"]:
@@ -89,16 +101,24 @@ def note_for_pad(pad: int, state: dict) -> int:
 
 def settings_color(pad: int, state: dict) -> LedColor:
     """Return the LedColor for *pad* while the settings overlay is shown."""
+    if pad == NOTE_ROUTING_SETTING_PAD:
+        return SETTING_DIM
     if pad in SIDE_COLUMN_PADS and pad not in SCALE_SETTING_PADS:
         return BACKGROUND_OFF
     if pad in INACTIVE_SETTINGS_PADS:
         return BACKGROUND_OFF
     if pad in OVERLAP_SETTING_PADS:
         return SETTING_ON if state["row_stride"] == OVERLAP_SETTING_PADS[pad] else UNUSED_GREY
+    if pad == SMALL_AXIS_INVERT_SETTING_PAD:
+        return SETTING_ON if state.get("small_axis_invert", False) else SETTING_DIM
+    if pad == LARGE_AXIS_INVERT_SETTING_PAD:
+        return SETTING_ON if state.get("large_axis_invert", False) else SETTING_DIM
     if pad == AXIS_SETTING_PAD:
         return SETTING_ON if state["axis_flip"] else SETTING_DIM
     if pad == CHROMATIC_SETTING_PAD:
         return CHROMATIC_ON if state["chromatic"] else CHROMATIC_DIM
+    if pad == MODWHEEL_ROW_SETTING_PAD:
+        return SETTING_ON if state.get("note_top_row_modwheel", False) else SETTING_DIM
     if pad in ROOT_SETTING_PADS:
         note_class = ROOT_SETTING_PADS[pad]
         if state["root"] == note_class:
@@ -121,10 +141,16 @@ def handle_settings_pad(pad: int, state: dict) -> bool:
     """
     if pad in OVERLAP_SETTING_PADS:
         state["row_stride"] = OVERLAP_SETTING_PADS[pad]
+    elif pad == SMALL_AXIS_INVERT_SETTING_PAD:
+        state["small_axis_invert"] = not state.get("small_axis_invert", False)
+    elif pad == LARGE_AXIS_INVERT_SETTING_PAD:
+        state["large_axis_invert"] = not state.get("large_axis_invert", False)
     elif pad == AXIS_SETTING_PAD:
         state["axis_flip"] = not state["axis_flip"]
     elif pad == CHROMATIC_SETTING_PAD:
         state["chromatic"] = not state["chromatic"]
+    elif pad == MODWHEEL_ROW_SETTING_PAD:
+        state["note_top_row_modwheel"] = not state.get("note_top_row_modwheel", False)
     elif pad in ROOT_SETTING_PADS:
         state["root"] = ROOT_SETTING_PADS[pad]
     elif pad in SCALE_SETTING_PADS:
@@ -261,4 +287,4 @@ def arrow_color(
     if remaining_steps <= 0:
         return LP3_ARROW_INACTIVE
     return min(0x7F, active_color + max(0, 4 - remaining_steps))
-# gargoyles rule
+# ~gargoyles rule~
