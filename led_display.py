@@ -19,6 +19,10 @@ from constants import (
     SYSEX_SCROLL,
     LP3_SYSEX_SCROLL,
     LP3_SCROLL_SPEED,
+    LP3_SYSEX_DAW_MODE,
+    LP3_DAW_MODE_ON,
+    LP3_DAW_MODE_OFF,
+    LP3_SYSEX_LAYOUT_SELECT,
     SYSEX_LAYOUT,
     LPP_SYSEX_MODE_SELECT,
     LPP_SYSEX_LAYOUT_SELECT,
@@ -144,6 +148,49 @@ def set_layout(layout: int) -> None:
     else:
         data = prefix + [SYSEX_LAYOUT, layout, 0xF7]
     device.midiOutSysex(_sysex_bytes(data))
+
+def set_daw_mode(enabled: bool) -> None:
+    """MK3 only: enable/disable DAW mode (10h).
+
+    Used by the standby escape purely for its side effect on the *hardware's*
+    Session button — per the LPX PRM p.16, "when DAW mode is enabled, the
+    Session button will light and become available to press". The Session and
+    DAW Fader layouts it also unlocks live on the device's separate DAW
+    interface, which this script is not bound to and never speaks to.
+    """
+    if _config["mode"] != "lp3":
+        return
+    data = list(_config["sysex_prefix"]) + [
+        LP3_SYSEX_DAW_MODE, LP3_DAW_MODE_ON if enabled else LP3_DAW_MODE_OFF, 0xF7,
+    ]
+    device.midiOutSysex(_sysex_bytes(data))
+
+def request_layout_readback() -> None:
+    """MK3 only: ask which layout the device is currently showing (00h, no data).
+
+    The reply (prefix + 00h + <layout> + F7) comes back on the interface the
+    request was sent from — this script's — which is what makes a button press
+    the script cannot otherwise see (Session, whose CC goes to the DAW
+    interface) observable from here. Parse replies with parse_layout_readback.
+    """
+    if _config["mode"] != "lp3":
+        return
+    data = list(_config["sysex_prefix"]) + [LP3_SYSEX_LAYOUT_SELECT, 0xF7]
+    device.midiOutSysex(_sysex_bytes(data))
+
+def parse_layout_readback(sysex: bytes) -> int | None:
+    """Return the <layout> byte of a layout readback reply, or None if *sysex*
+    isn't one (wrong prefix, wrong command, or the request echoed back)."""
+    if _config["mode"] != "lp3":
+        return None
+    prefix = bytes(_config["sysex_prefix"])
+    if not sysex.startswith(prefix):
+        return None
+    body = sysex[len(prefix):]
+    # prefix + 00h + <layout> + F7 — the 2-byte body is the data-less request.
+    if len(body) != 3 or body[0] != LP3_SYSEX_LAYOUT_SELECT or body[-1] != 0xF7:
+        return None
+    return body[1]
 
 def supports_text_scroll() -> bool:
     """True on surfaces with the native scrolling-text SysEx (MK2, LPX, LPM3).

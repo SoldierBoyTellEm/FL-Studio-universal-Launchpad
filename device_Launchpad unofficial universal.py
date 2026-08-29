@@ -495,8 +495,14 @@ class LaunchpadSurface:
     #      when the device answers "Session" (layout 00h, which p.7 notes is
     #      only selectable in DAW mode) we know Session was pressed.
     #
-    # The four-arrow chord also still returns, as a fallback that depends on no
-    # firmware behaviour beyond the arrows sending CC.
+    # All of this is confirmed against a Launchpad X, not just read off the
+    # references: with the device in Live + DAW mode and both interfaces
+    # listened to at once, every Session press showed up as a layout change to
+    # 00h on the MIDI interface within ~100ms of a 150ms poll, while CC 95
+    # appeared only on the DAW interface. The same capture showed the arrows
+    # transmitting nothing on either interface (the firmware keeps them for its
+    # Note-layout transpose), which is why the poll is the mechanism here and
+    # not merely a fallback — there is no button press to listen for.
     def _standby_available(self) -> bool:
         return self.device_family in MK3_PROTOCOL_FAMILIES
 
@@ -528,34 +534,39 @@ class LaunchpadSurface:
         return False
 
     def _handle_standby_input(self, event, status: int) -> bool:
-        """Raw input while released to Live mode. Watches for the four-arrow
-        chord as a second way back, and logs the first few events so the device
-        log records what this hardware actually sends in Live mode. Returns
-        True only if the event was consumed (chord completed)."""
-        if self._standby_input_probe_remaining > 0:
+        """Raw input while released to Live mode. Nothing here can end standby —
+        that is the layout poll's job — so this only logs, and always returns
+        False so the event passes through to FL.
+
+        Measured on a Launchpad X (Live mode + DAW mode, listening on both
+        interfaces while the buttons were pressed):
+
+          - grid pads send notes on the MIDI interface, i.e. straight through
+            to FL, which is the pass-through the escape is for;
+          - Session/Note/Custom send CC 95/96/97 on the *DAW* interface only;
+          - the arrows send nothing at all, on either interface — the firmware
+            consumes them for its own Note-layout transpose.
+
+        That last point is why there is no button-based way back from here: an
+        arrow chord in Live mode is unobservable, so the poll is the mechanism,
+        not a fallback. Notes are skipped by the probe because pads stream
+        continuously once someone plays the surface.
+        """
+        if (
+            self._standby_input_probe_remaining > 0
+            and status not in (midi.MIDI_NOTEON, midi.MIDI_NOTEOFF)
+        ):
             self._standby_input_probe_remaining -= 1
             _log(
                 f"standby input probe: status={event.status:#04x} "
                 f"data1={event.data1} data2={event.data2}"
             )
-        if status != midi.MIDI_CONTROLCHANGE or event.data1 not in self._arrow_ccs():
-            return False
-        if event.data2 > 0:
-            self._arrows_held.add(event.data1)
-            if len(self._arrows_held) < 4:
-                # Let the partial chord through — in Live mode the arrows are
-                # the firmware's own transpose/scroll controls, and swallowing
-                # them would break the layout the user came here to use.
-                return False
-            self._exit_standby("four arrows")
-            return True
-        self._arrows_held.discard(event.data1)
         return False
 
     def _enter_standby(self) -> None:
         _log(
             "standby: released to Live mode (four-arrow escape); "
-            "press Session — or the four arrows again — to return"
+            "press Session to return"
         )
         self._stop_fpc_scroll()
         self._release_all_notes()
@@ -583,10 +594,10 @@ class LaunchpadSurface:
         # the reply that merely confirms Live mode isn't read as a Session press.
         self._standby_next_poll = 0.0
         self._standby_last_layout = None
-        # Input passes through untouched from here, so the arrow releases that
-        # end the chord will never reach _handle_standby_chord. Drop the held
-        # set now rather than leaving it full — a stale 4 would re-fire the
-        # chord on the first arrow pressed after the surface is reclaimed.
+        # The arrow releases that end the chord never arrive: Live mode stops
+        # transmitting the arrows entirely (measured). Drop the held set now
+        # rather than leaving it full — a stale 4 would re-fire the chord on the
+        # first arrow pressed after the surface is reclaimed.
         self._arrows_held.clear()
         self._standby_chord_fired = False
         # Same for the up/down combo trackers, whose releases are also lost.
@@ -729,6 +740,13 @@ class LaunchpadSurface:
         self._last_rack_signature = fm.rack_signature()
         fm.remember_slot_assignment_names(self.state, self._fpc_slot_last_known_names)
         self._active_layout = None
+        # Start from Standalone. A previous run that ended without a clean
+        # deinit — a script reload while the standby escape was active, or
+        # another app that left the device in DAW mode — would otherwise leave
+        # DAW mode on, and this run's eventual exit would then land the device
+        # on the dead Session layout (see on_deinit).
+        if self.device_family in PROGRAMMER_MODE_FAMILIES:
+            led_display.set_daw_mode(False)
         led_display.clear_surface(self._grid_led_cache, self._top_led_cache)
         self._restore_surface_mode()
         if state_file_missing:
@@ -738,16 +756,24 @@ class LaunchpadSurface:
     def on_deinit(self) -> None:
         self._save_state()
         self._release_all_notes()
-        if self._standby:
-            # Leave the device standalone-clean rather than in the DAW mode
-            # standby borrowed to light the Session key.
-            self._standby = False
-            led_display.set_daw_mode(False)
+        self._standby = False
         if self._fpc_scroll_active:
             self._fpc_scroll_active = False
             led_display.stop_scroll()
         led_display.clear_surface(self._grid_led_cache, self._top_led_cache)
         if self.device_family in PROGRAMMER_MODE_FAMILIES:
+            # Revert to Standalone before the Live-mode toggle, both because the
+            # MK3 references ask every DAW/script to do it on exit — "the device
+            # remains useful as a standalone device once the DAW is done using
+            # it (without power cycling to restore it)" (LPX PRM p.16) — and
+            # because of what Live mode lands on: "Session layout, or Note mode
+            # when not in DAW mode" (p.8; the Mini says Custom Mode 2 instead).
+            # With DAW mode still on, Live mode drops the device onto the
+            # *Session* layout, which is inert with no DAW attached — the grid
+            # is dead and the Session key appears to do nothing. Clearing DAW
+            # mode first makes Live mode land on the standalone layout instead.
+            # No-op on the original Pro, which isn't an lp3-dialect device.
+            led_display.set_daw_mode(False)
             led_display.set_layout(LP3_LIVE_MODE)
             self._active_layout = LP3_LIVE_MODE
         elif self.device_family != DEVICE_FAMILY_MK1:
