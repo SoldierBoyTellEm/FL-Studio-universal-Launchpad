@@ -101,6 +101,15 @@ except ImportError:  # Local editing fallback outside FL Studio.
         def getSongStepPos(self):
             return -1
 
+        def getTrackCount(self): return 0
+        def trackCount(self): return 2
+        def getTrackColor(self, *_args): return 0
+        def isTrackSelected(self, *_args): return False
+        def setActiveTrack(self, *_args): return None
+        def selectTrack(self, *_args): return None
+        def isTrackArmed(self, *_args): return False
+        def armTrack(self, *_args): return None
+
     class _DummyGeneral:
         def getRecPPB(self):
             return 4 * 96

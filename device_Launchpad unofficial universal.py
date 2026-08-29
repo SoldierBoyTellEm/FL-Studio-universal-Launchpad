@@ -1,6 +1,12 @@
 # name=Novation Launchpad unofficial universal
-# supportedDevices=Launchpad MK2,Launchpad [MK2],Novation Launchpad MK2,Launchpad X,Novation Launchpad X,Launchpad Mini MK3,Novation Launchpad Mini MK3,Launchpad S,Novation Launchpad S,Launchpad,Novation Launchpad,Launchpad Mini,Novation Launchpad Mini,Launchpad Mini MK2,Novation Launchpad Mini MK2
-# supportedHardwareIds=00 20 29 69,00 20 29 03 01,00 20 29 13 01,00 20 29 20 00
+# supportedDevices=Launchpad MK2,Launchpad [MK2],Novation Launchpad MK2,Launchpad X,Novation Launchpad X,Launchpad Mini MK3,Novation Launchpad Mini MK3,Launchpad Pro,Novation Launchpad Pro,MIDIIN2 (Launchpad Pro),MIDIOUT2 (Launchpad Pro),LPProMK3 MIDI,Launchpad Pro MK3,Novation Launchpad Pro MK3,Launchpad S,Novation Launchpad S,Launchpad,Novation Launchpad,Launchpad Mini,Novation Launchpad Mini,Launchpad Mini MK2,Novation Launchpad Mini MK2
+# supportedHardwareIds=00 20 29 69,00 20 29 03 01,00 20 29 13 01,00 20 29 23 01,00 20 29 51,00 20 29 20 00
+# NOTE: 00 20 29 23 01 (Launchpad Pro MK3) is an UNVERIFIED guess — the LPP3
+#       guide misprints the Pro MK3's Device Inquiry reply as Mini MK3's id
+#       (00 20 29 13 01), so it follows the family's 03/13/23 pattern instead.
+#       Detection falls back to the distinctive "LPProMK3 MIDI" port name, so
+#       the device is still recognised if the guess is wrong; correct this line
+#       and LPP3_DEVICE_ID_PREFIX once real hardware logs its id.
 # NOTE: Hardware IDs for the original Launchpad, Mini MK1, and Mini MK2 are not
 #       yet confirmed — those devices do not respond to MIDI Device Inquiry, so FL
 #       may report an empty hardware ID.  To fill in a slot:
@@ -43,9 +49,9 @@ import step_sequencer as ss
 import custom_mode as cm
 import device_profile as dp
 import plugin_overrides as po
-import modulators as xp
 import modulators as ps
 import channel_lock as cl
+import mixer_view as mv
 from modulators import PadFader
 from gestures import ButtonGesture
 from constants import (
@@ -64,16 +70,13 @@ from constants import (
     PERFORMANCE_PAGE_HOTKEY_PADS,
     # modes
     MODE_NOTE, MODE_FPC, MODE_PERFORMANCE, MODE_CUSTOM,
-    MODE_XY_PAD, MODE_STEP_SEQ, MODE_BLANK,
-    # MIDI routing
-    SESSION_CHANNEL,
+    MODE_XY_PAD, MODE_STEP_SEQ, MODE_MIXER, MODE_BLANK,
     # timing
     TAP_AND_HOLD_DURATION_SECONDS,
     PERFORMANCE_DOUBLE_TAP_SECONDS,
     # note range
     LOWEST_NOTE, HIGHEST_NOTE,
     PAD_DISABLED,
-    LP3_BACKGROUND_OFF,
     LP3_MENU_ACTIVE,
     LP3_MENU_INACTIVE,
     LP3_MENU_LOCKED,
@@ -82,16 +85,14 @@ from constants import (
     LP3_ARROW_OCTAVE_ACTIVE,
     LP3_ARROW_PAN_ACTIVE,
     LP3_ARROW_INACTIVE,
-    SYSEX_PREFIX,
     FPC_SCROLL_COLOR,
     STATE_FILE,
     DEFAULT_STATE,
     SIDE_COLUMN_PADS,
     NOTE_TOP_ROW_MODWHEEL_PADS,
     NOTE_ROUTING_SETTING_PAD,
-    XY_PAD_X_CC, XY_PAD_Y_CC,
+    XY_PAD_CC_PAIRS, XY_PAD_ACTIVE_HUES,
     performance_modwheel_CC,
-    XY_VERT_FADER_CCS, XY_HORIZ_FADER_CCS,
     XY_FADER_ON_COLOR, XY_FADER_OFF_COLOR, performance_modwheel_COLOR,
     XY_PAGE_XY, XY_PAGE_VERT, XY_PAGE_HORIZ,
     XY_PAGE_VERT_BIPOLAR, XY_PAGE_HORIZ_BIPOLAR, XY_PAGE_COUNT,
@@ -99,12 +100,18 @@ from constants import (
     NOTE_LOCK_PULSE_RGB_8BIT,
     mk1_note_to_pad,
     LedColor,
-    LED_OFF,
+    MIXER_PAGE_LAYOUTS,
 )
 DEVICE_FAMILY_MK1 = dp.DEVICE_FAMILY_MK1
 DEVICE_FAMILY_MK2 = dp.DEVICE_FAMILY_MK2
 DEVICE_FAMILY_LPX = dp.DEVICE_FAMILY_LPX
 DEVICE_FAMILY_LPM3 = dp.DEVICE_FAMILY_LPM3
+DEVICE_FAMILY_LPP = dp.DEVICE_FAMILY_LPP
+DEVICE_FAMILY_LPP3 = dp.DEVICE_FAMILY_LPP3
+# Protocol groupings live in device_profile so adding a device can't leave one
+# of these membership tests behind.
+PROGRAMMER_MODE_FAMILIES = dp.PROGRAMMER_MODE_FAMILIES
+SOFTWARE_PULSE_FAMILIES = dp.SOFTWARE_PULSE_FAMILIES
 LP3_PROGRAMMER_MODE = dp.LP3_PROGRAMMER_MODE
 LP3_LIVE_MODE = dp.LP3_LIVE_MODE
 
@@ -129,7 +136,7 @@ class LaunchpadSurface:
         self.script_dir  = _script_dir()
         self.state_path  = self.script_dir / STATE_FILE
         self.midi_port   = 0
-        self.state       = dict(DEFAULT_STATE)
+        self.state       = state_io.default_state()
         self.settings_visible = False
         self.surface_mode     = MODE_NOTE
         self._restoring_mode  = False
@@ -146,6 +153,18 @@ class LaunchpadSurface:
         self.active_notes: dict[tuple[int, int], int] = {}
         self._xy_last_x_val: int | None = 0
         self._xy_last_y_val: int | None = 127
+        # Last cursor position per parallel XY pad, indexed like
+        # XY_PAD_CC_PAIRS/_xy_pad_index — each pad remembers its own
+        # position independently. _xy_last_x_val/_xy_last_y_val above always
+        # mirror the currently active slot; on_init loads all 4 from saved
+        # state, and _handle_xy_pad_cycle/_save_state keep the active slot
+        # in sync with them.
+        self._xy_pad_positions: list[list[int]] = [[0, 127] for _ in range(len(XY_PAD_CC_PAIRS))]
+        # Which of the 4 parallel XY pads (own CC pair, own hue) is active on
+        # the positional XY page, cycled by left/right there. RAM-only by
+        # design — index 3 (CC 102/103) matches the sole pre-existing pad, so
+        # a fresh session behaves exactly as it did before this existed.
+        self._xy_pad_index: int = len(XY_PAD_CC_PAIRS) - 1
         # XY fader pages: one PadFader per grid fader (8 vertical + 8 horizontal,
         # unipolar and bipolar) plus the side-column modwheel.  Values are
         # 0.0–127.0 floats keyed by CC.
@@ -161,27 +180,28 @@ class LaunchpadSurface:
             XY_PAGE_VERT_BIPOLAR: {},
             XY_PAGE_HORIZ_BIPOLAR: {},
         }
-        for cc, pads in xp.vert_fader_defs():
+        for cc, pads in ps.vert_fader_defs():
             self._xy_faders[cc] = PadFader(pads, minimum=0.0, maximum=127.0)
             for p in pads:
                 self._xy_pad_to_fader[XY_PAGE_VERT][p] = cc
-        for cc, pads in xp.horiz_fader_defs():
+        for cc, pads in ps.horiz_fader_defs():
             self._xy_faders[cc] = PadFader(pads, minimum=0.0, maximum=127.0)
             for p in pads:
                 self._xy_pad_to_fader[XY_PAGE_HORIZ][p] = cc
-        for cc, pads in xp.vert_bipolar_fader_defs():
+        for cc, pads in ps.vert_bipolar_fader_defs():
             self._xy_faders[cc] = PadFader(pads, minimum=0.0, maximum=127.0, bipolar=True)
             self._xy_fader_values[cc] = 63.5
             for p in pads:
                 self._xy_pad_to_fader[XY_PAGE_VERT_BIPOLAR][p] = cc
-        for cc, pads in xp.horiz_bipolar_fader_defs():
+        for cc, pads in ps.horiz_bipolar_fader_defs():
             self._xy_faders[cc] = PadFader(pads, minimum=0.0, maximum=127.0, bipolar=True)
             self._xy_fader_values[cc] = 63.5
             for p in pads:
                 self._xy_pad_to_fader[XY_PAGE_HORIZ_BIPOLAR][p] = cc
-        self._performance_modwheel_fader = PadFader(xp.modwheel_pads(), minimum=0.0, maximum=127.0)
+        self._performance_modwheel_fader = PadFader(ps.modwheel_pads(), minimum=0.0, maximum=127.0)
         self._xy_faders[performance_modwheel_CC] = self._performance_modwheel_fader
         self._xy_fader_values[performance_modwheel_CC] = 63.5
+        self._xy_fader_default_values = dict(self._xy_fader_values)
         # Note mode: top row (81-88) + its side-column pad (89) become a 9-wide
         # modwheel fader when toggled on (settings pad 85). Drives the same CC
         # and shared value as the performance modwheel fader above.
@@ -214,6 +234,11 @@ class LaunchpadSurface:
         self.device_family = DEVICE_FAMILY_MK2
         self.device_label = "Launchpad MK2"
         self._active_layout: int | None = None
+        # Launchpad Pro bring-up aid: log the first few raw input events so the
+        # log distinguishes "no input at all" (bound to the wrong port pair)
+        # from "input arrives with Note-layout numbers" (Programmer layout
+        # never engaged). Counts down to 0 and then stays silent.
+        self._lpp_input_probe_remaining = 0
         self._side_column_is_cc = False
         self._top_ccs = TOP_CCS
         self._top_octave_down = TOP_OCTAVE_DOWN
@@ -224,10 +249,34 @@ class LaunchpadSurface:
         self._top_note_mode = TOP_NOTE_MODE
         self._top_fpc_mode = TOP_FPC_MODE
         self._top_record_arm = TOP_RECORD_ARM
+        # Pro-only dedicated buttons (device_profile sets these for lpp/lpp3;
+        # None everywhere else, so they never match an incoming CC).
+        self._top_custom_mode = None
+        self._top_step_seq = None
+        self._top_modulators = None
+        self._top_routing = None
+        self._top_mixer = None
+        self._top_mixer_arm = None
+        self._mixer_subpage = 0
+        # Pro MK3 CC 101-108 view shortcuts (with CC 10 as the original-Pro
+        # test mirror for slot 0). Filled by device_profile.
+        self._view_shortcut_ccs: dict[int, int] = {}
+        self._view_shortcut_gestures = {slot: ButtonGesture() for slot in range(8)}
+        # Channel-routing page: full-grid overlay mapping the first 64 rack
+        # channels, toggling which ones the current page feeds.
+        self._routing_page_visible = False
+        # pad -> [(channel, note), ...] for pads currently sounding through
+        # multi-channel routing. active_pads still holds the primary target
+        # so existing lighting / rollback paths keep their contract.
+        self._pad_routed_notes: dict[int, list[tuple[int, int]]] = {}
         # Top mode-button gestures (tap / double-tap / long-hold). Long-holds
         # are polled uniformly from _poll_button_holds in on_idle.
         self._note_gesture = ButtonGesture()
         self._fpc_gesture = ButtonGesture()
+        # Pro devices: Step Sequencer has its own bottom-row button (Device is
+        # FPC-only there), so its long-hold settings-pane gesture needs its
+        # own tracker instead of riding on _fpc_gesture.
+        self._step_seq_gesture = ButtonGesture()
         self._performance_gesture = ButtonGesture(double_tap_seconds=PERFORMANCE_DOUBLE_TAP_SECONDS)
         self._record_gesture = ButtonGesture()
         self._note_routing_gesture = ButtonGesture()
@@ -290,6 +339,7 @@ class LaunchpadSurface:
             MODE_CUSTOM: self._custom_grid_lighting,
             MODE_FPC: self._fpc_grid_lighting,
             MODE_NOTE: self._note_grid_lighting,
+            MODE_MIXER: self._mixer_grid_lighting,
         }
     _CUSTOM_FADER_MICRO_BRIGHTNESS = (0.25, 0.5, 0.75, 1.0)
     def _now(self) -> float:
@@ -312,7 +362,11 @@ class LaunchpadSurface:
                 self._enter_note_mode()
             self.settings_visible = not self.settings_visible
             self._refresh_needed = True
-        if self.surface_mode == MODE_STEP_SEQ and self._fpc_gesture.poll_hold(now):
+        # Pro devices: Step Sequencer's own bottom-row button owns this hold
+        # (Device/_fpc_gesture is FPC-only there); everyone else keeps it on
+        # the Device/FPC button that cycles into Step Sequencer.
+        step_seq_gesture = self._step_seq_gesture if self._is_pro_device() else self._fpc_gesture
+        if self.surface_mode == MODE_STEP_SEQ and step_seq_gesture.poll_hold(now):
             self._step_seq_settings_visible = not self._step_seq_settings_visible
             self._refresh_needed = True
         if self._performance_gesture.poll_hold(now):
@@ -322,6 +376,10 @@ class LaunchpadSurface:
         if self._record_gesture.poll_hold(now):
             transport.globalTransport(midi.FPT_Record, 1, getattr(midi, "PME_System", 0))
             self._refresh_needed = True
+        for slot, gesture in self._view_shortcut_gestures.items():
+            if gesture.poll_hold(now):
+                self._store_view_shortcut(slot)
+                self._refresh_needed = True
         if (
             self.settings_visible
             and self.surface_mode == MODE_NOTE
@@ -360,16 +418,32 @@ class LaunchpadSurface:
             return
         self._fpc_scroll_active = False
         led_display.stop_scroll()
-        led_display.clear_surface(self._grid_led_cache, self._top_led_cache)
+        # Only invalidate the caches — do NOT physically blank the surface.
+        # clear_surface() was used here originally, but it blacks out every LED
+        # and the repaint only lands on the next refresh, so leaving FPC (the
+        # one mode that can have a scroll running) flashed the whole grid dark
+        # for a frame. Empty caches already force the next refresh to repaint
+        # every pad, which overwrites whatever the scroll left behind.
+        self._grid_led_cache.clear()
+        self._top_led_cache.clear()
 
     def _maybe_scroll_fpc_placeholder(self) -> None:
-        """Scroll "FPC" once when FPC mode has no mapped banks, so the surface
-        isn't left entirely blank. Native-scroll surfaces only (MK2/LPX/LPM3)."""
+        """Scroll "FPC" once when FPC mode has no *valid* mapped bank, so the
+        surface isn't left entirely blank. Native-scroll surfaces only.
+
+        Checks has_any_valid_fpc_slot_assignment rather than the raw
+        has_any_fpc_slot_assignment: the raw check only looks at the saved
+        slot data, so a stale assignment left pointing at a deleted/non-FPC
+        channel (e.g. after a channel-rack edit outran the recovery pass)
+        would still count as "mapped" and wrongly suppress the placeholder.
+        speed=9 asks for a brisker scroll than each dialect's own default
+        (MK3's pads/second unit; MK2/LPP's native 1-7 scale, capped at 7).
+        """
         if (
             led_display.supports_text_scroll()
-            and not fm.has_any_fpc_slot_assignment(self.state)
+            and not fm.has_any_valid_fpc_slot_assignment(self.state)
         ):
-            led_display.scroll_text("FPC", FPC_SCROLL_COLOR)
+            led_display.scroll_text("FPC", FPC_SCROLL_COLOR, speed=9)
             self._fpc_scroll_active = True
 
     def _begin_mode_switch(self, mode) -> None:
@@ -380,6 +454,7 @@ class LaunchpadSurface:
         self.surface_mode = mode
         self.settings_visible = False
         self._step_seq_settings_visible = False
+        self._routing_page_visible = False
         self._release_all_notes()
         self._record_mode_family(mode)
 
@@ -403,7 +478,13 @@ class LaunchpadSurface:
         """Enter the remembered last member of a mode-button family, with
         sensible fallbacks when that member is currently unavailable."""
         if family == "note":
-            if self._note_family_last == MODE_CUSTOM and self._custom_modes:
+            # Pro devices: Note is dedicated (Custom has its own User key), so
+            # it never lands on Custom via family memory.
+            if (
+                self.device_family not in (DEVICE_FAMILY_LPP, DEVICE_FAMILY_LPP3)
+                and self._note_family_last == MODE_CUSTOM
+                and self._custom_modes
+            ):
                 self._enter_custom_mode_selector()
             else:
                 self._enter_note_mode()
@@ -424,10 +505,14 @@ class LaunchpadSurface:
         _log(f"init script_dir={self.script_dir}")
         _log_device_identification()
         self._configure_device_profile()
+        if self.device_family == DEVICE_FAMILY_LPP:
+            self._lpp_input_probe_remaining = 16
         self.midi_port = device.getPortNumber()
-        self._load_state()
+        state_file_missing = self._load_state()
         self._prepare_custom_modes()
         state_io.load_flp_state(self.midi_port, self.state)
+        self._log_state_warnings()
+        self._apply_loaded_state()
         # Restore the active custom slot for the session regardless of which
         # surface mode the session starts in. Previously this only happened
         # inside _restore_surface_mode's MODE_CUSTOM branch, so a session that
@@ -435,11 +520,6 @@ class LaunchpadSurface:
         # _save_state() then overwrote the project's saved slot with 0. Any
         # later visit to Custom (cycle or restored-from-outside) displayed the
         # wrong layout until a selector pad was pressed.
-        saved_custom_index = int(self.state.get("custom_mode_index", 0))
-        if self._custom_modes:
-            self._custom_mode_index = max(0, min(len(self._custom_modes) - 1, saved_custom_index))
-        if self._live_custom_mode_reading and saved_custom_index >= len(self._custom_modes):
-            self._pending_custom_mode_index = saved_custom_index
         # Note: self.surface_mode stays at its __init__ default (MODE_NOTE) here —
         # _restore_surface_mode() below transitions to the saved mode via the
         # normal _enter_*_mode() setters so the programmer-mode layout SysEx is
@@ -447,15 +527,6 @@ class LaunchpadSurface:
         # SysEx when self.surface_mode already equals MODE_PERFORMANCE, which
         # would happen here if we pre-assigned it from saved state — leaving
         # the hardware stuck in Live mode after a restart with that mode saved.)
-        self._xy_last_x_val = int(self.state.get("xy_cursor_x", 0))
-        self._xy_last_y_val = int(self.state.get("xy_cursor_y", 127))
-        saved_faders = self.state.get("xy_fader_values", {})
-        if isinstance(saved_faders, dict):
-            for k, v in saved_faders.items():
-                try:
-                    self._xy_fader_values[int(k)] = float(v)
-                except (ValueError, TypeError):
-                    pass
         if self._repair_invalid_note_window():
             self._save_state()
         if bool(self.state.get("lights_out", False)):
@@ -470,15 +541,18 @@ class LaunchpadSurface:
         self._active_layout = None
         led_display.clear_surface(self._grid_led_cache, self._top_led_cache)
         self._restore_surface_mode()
+        if state_file_missing:
+            self._save_state()
         _log(f"startup state mode={self.surface_mode} settings={self.settings_visible}")
         self._refresh_needed = False
     def on_deinit(self) -> None:
+        self._save_state()
         self._release_all_notes()
         if self._fpc_scroll_active:
             self._fpc_scroll_active = False
             led_display.stop_scroll()
         led_display.clear_surface(self._grid_led_cache, self._top_led_cache)
-        if self.device_family in (DEVICE_FAMILY_LPX, DEVICE_FAMILY_LPM3):
+        if self.device_family in PROGRAMMER_MODE_FAMILIES:
             led_display.set_layout(LP3_LIVE_MODE)
             self._active_layout = LP3_LIVE_MODE
         elif self.device_family != DEVICE_FAMILY_MK1:
@@ -522,6 +596,11 @@ class LaunchpadSurface:
             self._last_plugin_override_id = plugin_override_id
             self._plugin_override_held_pads.clear()
             self._refresh_needed = True
+        if self.surface_mode == MODE_MIXER and mv.armed_tracks():
+            now = time.monotonic()
+            if now - self._pulse_last_frame >= 1.0 / 30.0:
+                self._pulse_last_frame = now
+                self._refresh_needed = True
         self._poll_button_holds(time.monotonic())
         if (
             self._fpc_selector_pressed is not None
@@ -570,7 +649,7 @@ class LaunchpadSurface:
                     self._step_lock_page_test_note_sent = True
                 self._refresh_needed = True
         if (
-            self.device_family in (DEVICE_FAMILY_MK2, DEVICE_FAMILY_MK1)
+            self.device_family in SOFTWARE_PULSE_FAMILIES
             and cl.is_locked(self.state, cl.NOTE_CONTEXT)
             and not bool(self.state.get("lights_out", False))
         ):
@@ -599,6 +678,23 @@ class LaunchpadSurface:
         self._refresh_surface()
         self._refresh_needed = False
     def on_project_load(self, _status: int) -> None:
+        # FL invokes this once when loading begins and once after it succeeds.
+        # Read project-owned state only after the latter, otherwise we would
+        # capture the previous project's track-500 payload.
+        if _status != getattr(midi, "PL_LoadOk", 100):
+            return
+        self._release_all_notes()
+        state_file_missing = self._load_state()
+        state_io.load_flp_state(self.midi_port, self.state)
+        self._log_state_warnings()
+        self._apply_loaded_state()
+        self.surface_mode = MODE_BLANK
+        self.settings_visible = False
+        self._step_seq_settings_visible = False
+        self._routing_page_visible = False
+        self._restore_surface_mode()
+        if state_file_missing:
+            self._save_state()
         # A freshly loaded project's saved indices are trusted as-is; just seed
         # the recovery baseline so later rack edits can be detected/repaired.
         self._last_rack_signature = fm.rack_signature()
@@ -616,22 +712,8 @@ class LaunchpadSurface:
             self._save_state()
     def _prepare_custom_modes(self) -> None:
         cm.prepare_runtime(self, _log)
-    def _reload_custom_modes(self, *, live_first: bool) -> None:
-        cm.reload_runtime(self, live_first=live_first, log=_log)
-    def _custom_mode_product_id(self) -> int | None:
-        return cm.product_id(self.device_family)
-    def _custom_mode_slot_ids(self) -> tuple[int, ...]:
-        return cm.slot_ids(self.device_family)
-    def _custom_mode_read_request(self, slot_id: int) -> bytes | None:
-        return cm.read_request(self.device_family, slot_id)
-    def _start_live_custom_mode_read(self) -> None:
-        cm.start_live_read(self, _log)
     def on_sysex(self, event) -> None:
         cm.handle_sysex(self, event, _log)
-    def _event_sysex_bytes(self, event) -> bytes:
-        return cm.event_sysex_bytes(event)
-    def _custom_mode_reply_slot(self, sysex: bytes) -> tuple[int, int] | None:
-        return cm.reply_slot(self.device_family, sysex)
     def on_update_live_mode(self, _last_track: int) -> None:
         if pm.performance_available():
             if self.surface_mode == MODE_PERFORMANCE:
@@ -643,6 +725,13 @@ class LaunchpadSurface:
             self._launch_map_ready = pm.update_launch_map(self._launch_map_ready)
         self._refresh_needed = True
     def on_midi_in(self, event) -> None:
+        if self._lpp_input_probe_remaining > 0:
+            self._lpp_input_probe_remaining -= 1
+            _log(
+                f"LPP input probe: status={event.status:#04x} "
+                f"data1={event.data1} data2={event.data2} "
+                f"(Programmer layout grid pads are 11-88, top row 91-98)"
+            )
         if self.device_family == DEVICE_FAMILY_MK1 and (event.status & 0xF0) in (
             midi.MIDI_NOTEON, midi.MIDI_NOTEOFF
         ):
@@ -679,7 +768,13 @@ class LaunchpadSurface:
         if status != midi.MIDI_NOTEON or event.data2 <= 0:
             return
         note_info = self.active_pads.pop(event.data1, None)
+        routed = self._pad_routed_notes.pop(event.data1, None)
         self._drop_recent_active_pad(event.data1)
+        if routed:
+            for channel_index, note in routed:
+                self._drop_active_note(channel_index, note)
+            self._refresh_needed = True
+            return
         if note_info is None:
             return
         channel_index, note = note_info
@@ -709,6 +804,17 @@ class LaunchpadSurface:
         event.handled = True
     # Grid pad routing
     def _handle_grid_pad(self, event, pad: int, velocity: int, pressed: bool) -> bool:
+        # Routing overlay owns the whole grid while visible, so no note ever
+        # sounds from a pad press meant to toggle a routing target.
+        if self._routing_page_visible:
+            if not self._routing_page_available():
+                # Surface changed out from under the page (e.g. mode switch).
+                self._routing_page_visible = False
+            else:
+                if pressed:
+                    self._handle_routing_page_press(pad)
+                    self._refresh_needed = True
+                return True
         if (
             pad == NOTE_ROUTING_SETTING_PAD
             and not pressed
@@ -739,6 +845,15 @@ class LaunchpadSurface:
             return self._handle_xy_pad(event, pad, velocity, pressed)
         if self.surface_mode == MODE_STEP_SEQ:
             return self._handle_step_sequencer_pad(event, pad, velocity, pressed)
+        if self.surface_mode == MODE_MIXER:
+            if pressed:
+                subpage = mv.subpage_for_pad(pad)
+                if subpage is not None:
+                    self._mixer_subpage = subpage
+                else:
+                    mv.select(pad)
+                self._refresh_needed = True
+            return True
         if self.surface_mode == MODE_PERFORMANCE:
             if not pm.performance_available():
                 if ss.is_channel_toggle_pad(pad):
@@ -832,25 +947,36 @@ class LaunchpadSurface:
             note          = self._note_for_pad(pad)
             channel_index = self._channel_for_pad(pad)
             if channel_index >= 0 and LOWEST_NOTE <= note <= HIGHEST_NOTE:
-                self.active_pads[pad] = (channel_index, note)
+                targets = self._route_targets(channel_index)
+                if not targets:
+                    targets = [channel_index]
+                self.active_pads[pad] = (targets[0], note)
+                self._pad_routed_notes[pad] = [(target, note) for target in targets]
                 self._mark_pad_recently_active(pad)
-                key = (channel_index, note)
-                self.active_notes[key] = self.active_notes.get(key, 0) + 1
                 # Consume the Launchpad event so FL MIDI learn/auto-detect does not
-                # see pad notes, then play the intended channel explicitly.
-                channels.midiNoteOn(
-                    channel_index, note, max(1, velocity or 127), midi_channel
-                )
+                # see pad notes, then play the intended channel(s) explicitly.
+                for target in targets:
+                    key = (target, note)
+                    self.active_notes[key] = self.active_notes.get(key, 0) + 1
+                    channels.midiNoteOn(
+                        target, note, max(1, velocity or 127), midi_channel
+                    )
                 led_display.refresh_grid_pad(pad, self._grid_lighting, self._grid_led_cache)
                 self._refresh_needed = True
                 return True
         else:
             note_info = self.active_pads.pop(pad, None)
+            routed = self._pad_routed_notes.pop(pad, None)
             self._drop_recent_active_pad(pad)
-            if note_info is not None:
+            if routed:
+                for target, routed_note in routed:
+                    self._drop_active_note(target, routed_note)
+                    channels.midiNoteOn(target, routed_note, 0, midi_channel)
+            elif note_info is not None:
                 channel_index, note = note_info
                 self._drop_active_note(channel_index, note)
                 channels.midiNoteOn(channel_index, note, 0, midi_channel)
+            if routed or note_info is not None:
                 led_display.refresh_grid_pad(pad, self._grid_lighting, self._grid_led_cache)
                 self._refresh_needed = True
                 return True
@@ -861,6 +987,11 @@ class LaunchpadSurface:
     def _handle_top_button(self, cc: int, pressed: bool, event) -> None:
         if pressed:
             _log(f"top button cc={cc} action={self._top_button_action_name(cc)}")
+        shortcut_slot = self._view_shortcut_ccs.get(cc)
+        if shortcut_slot is not None:
+            self._handle_view_shortcut(shortcut_slot, pressed)
+            self._refresh_needed = True
+            return
         if cc == self._top_performance:
             if self._handle_performance_button(pressed):
                 self._refresh_needed = True
@@ -877,6 +1008,55 @@ class LaunchpadSurface:
             self._handle_record_button(pressed, event)
             self._refresh_needed = True
             return
+        if cc == self._top_custom_mode:
+            if pressed and self._custom_modes:
+                self._enter_custom_mode_selector()
+            self._refresh_needed = True
+            return
+        if cc == self._top_step_seq:
+            self._handle_step_seq_button(pressed)
+            self._refresh_needed = True
+            return
+        if cc == self._top_modulators:
+            if pressed:
+                self._enter_xy_pad_mode()
+            self._refresh_needed = True
+            return
+        if cc == self._top_routing:
+            # Dead outside note/custom pages — those are the only surfaces with
+            # a routing context to edit.
+            if pressed and self._routing_page_available():
+                self._routing_page_visible = not self._routing_page_visible
+                # The overlay swallows grid input, so any pad held as the page
+                # opens would never see its note-off. Release first.
+                if self._routing_page_visible:
+                    self._release_all_notes()
+                self._refresh_needed = True
+            return
+        if cc == self._top_mixer:
+            if pressed:
+                self._enter_mixer_mode()
+            self._refresh_needed = True
+            return
+        if cc == self._top_mixer_arm:
+            if pressed and self.surface_mode == MODE_MIXER:
+                try:
+                    mv.toggle_arm(int(mixer.trackNumber()))
+                except Exception:
+                    pass
+            self._refresh_needed = True
+            return
+        if self._routing_page_visible and cc in (
+            self._top_octave_up, self._top_octave_down, self._top_pan_left, self._top_pan_right,
+        ):
+            # Overlay claims the arrows outright while open: up/down scroll one
+            # row, left/right jump a whole page. No held-combo/XY handling
+            # underneath — that's for surfaces this overlay isn't shown on.
+            if pressed:
+                self._step_routing_page(cc)
+                self._save_state()
+                self._refresh_needed = True
+            return
         # Track up/down held state for simultaneous-press combo detection (used in
         # both XY mode for page stepping and performance mode for modwheel toggle).
         if cc == self._top_octave_up:
@@ -884,6 +1064,9 @@ class LaunchpadSurface:
         if cc == self._top_octave_down:
             self._xy_down_held = pressed
         if self._handle_xy_octave(cc, pressed):
+            self._refresh_needed = True
+            return
+        if self._handle_xy_pad_cycle(cc, pressed):
             self._refresh_needed = True
             return
         if self._handle_performance_modwheel_combo(cc, pressed):
@@ -948,7 +1131,103 @@ class LaunchpadSurface:
             return "pan_right"
         if cc == self._top_record_arm:
             return "play/record"
+        if cc == self._top_custom_mode:
+            return "custom_modes"
+        if cc == self._top_step_seq:
+            return "step_sequencer"
+        if cc == self._top_modulators:
+            return "modulators"
+        if cc == self._top_routing:
+            return "channel_routing"
+        if cc == self._top_mixer:
+            return "mixer"
+        if cc == self._top_mixer_arm:
+            return "mixer_record_arm"
         return "unmapped"
+
+    # Pro view shortcuts -------------------------------------------------
+    # Each binding owns both a surface and the view state that identifies the
+    # currently visible page within it.  Keep this data declarative so future
+    # sub-pages only need to add their state fields here and in _recall.
+    def _view_shortcut_target(self) -> dict:
+        target = {"mode": self.surface_mode}
+        if self.surface_mode == MODE_CUSTOM:
+            target["custom_mode_index"] = self._custom_mode_index
+        elif self.surface_mode == MODE_XY_PAD:
+            target["xy_page"] = self._xy_page()
+        elif self.surface_mode == MODE_MIXER:
+            target["mixer_subpage"] = self._mixer_subpage
+        elif self.surface_mode == MODE_FPC:
+            target["fpc_page"] = fm.current_fpc_page(self.state)
+        elif self.surface_mode == MODE_STEP_SEQ:
+            target["step_channel_offset"] = int(self.state.get("step_channel_offset", 0))
+            target["step_offset"] = int(self.state.get("step_offset", 0))
+        elif self.surface_mode == MODE_PERFORMANCE:
+            target["performance_track_offset"] = int(self.state.get("performance_track_offset", 1))
+            target["performance_block_offset"] = int(self.state.get("performance_block_offset", 0))
+        return target
+
+    def _store_view_shortcut(self, slot: int) -> None:
+        shortcuts = list(self.state.get("view_shortcuts", [None] * 8))
+        shortcuts = (shortcuts + [None] * 8)[:8]
+        shortcuts[slot] = self._view_shortcut_target()
+        self.state["view_shortcuts"] = shortcuts
+        self._save_state()
+        _log(f"view shortcut {slot + 1} stored: {shortcuts[slot]}")
+
+    def _handle_view_shortcut(self, slot: int, pressed: bool) -> None:
+        gesture = self._view_shortcut_gestures[slot]
+        if pressed:
+            gesture.press(self._now())
+            return
+        released = gesture.release()
+        if not released.was_pressed or released.hold_fired:
+            return
+        shortcuts = self.state.get("view_shortcuts", [])
+        target = shortcuts[slot] if slot < len(shortcuts) else None
+        if isinstance(target, dict):
+            self._recall_view_shortcut(target)
+
+    def _recall_view_shortcut(self, target: dict) -> None:
+        mode = target.get("mode")
+        if mode == MODE_NOTE:
+            self._enter_note_mode()
+        elif mode == MODE_CUSTOM:
+            if self._custom_modes:
+                self._custom_mode_index = max(0, min(
+                    len(self._custom_modes) - 1, int(target.get("custom_mode_index", 0))
+                ))
+            self._enter_custom_mode_selector()
+        elif mode == MODE_XY_PAD:
+            self.state["xy_page"] = max(0, min(
+                XY_PAGE_COUNT - 1, int(target.get("xy_page", XY_PAGE_XY))
+            ))
+            self._enter_xy_pad_mode()
+        elif mode == MODE_MIXER:
+            self._enter_mixer_mode()
+            self._mixer_subpage = max(0, min(
+                len(MIXER_PAGE_LAYOUTS) - 1, int(target.get("mixer_subpage", 0))
+            ))
+            self._refresh_surface()
+        elif mode == MODE_FPC:
+            self.state["fpc_page"] = max(0, min(3, int(target.get("fpc_page", 0))))
+            self._enter_fpc_mode(suppress_gross_beat=True)
+        elif mode == MODE_STEP_SEQ:
+            self.state["step_channel_offset"] = max(0, int(target.get("step_channel_offset", 0)))
+            self.state["step_offset"] = max(0, int(target.get("step_offset", 0)))
+            self._enter_step_sequencer_mode()
+        elif mode == MODE_PERFORMANCE:
+            self.state["performance_track_offset"] = max(1, int(target.get("performance_track_offset", 1)))
+            self.state["performance_block_offset"] = max(0, int(target.get("performance_block_offset", 0)))
+            self._enter_performance_mode()
+        else:
+            return
+        self._save_state()
+        _log(f"view shortcut recalled: {target}")
+
+    def _is_pro_device(self) -> bool:
+        return self.device_family in (DEVICE_FAMILY_LPP, DEVICE_FAMILY_LPP3)
+
     def _session_key_is_inert(self) -> bool:
         """Pressing the session key does nothing when already in the modulator
         (XY) pages and performance mode can't be cycled to — there's no other
@@ -958,6 +1237,17 @@ class LaunchpadSurface:
 
     def _handle_performance_button(self, pressed: bool) -> bool:
         """Returns True if the surface changed and the LEDs need a refresh."""
+        if self._is_pro_device() and not pm.performance_available():
+            # Pro devices: Session's old fallback (the modulator/XY pages) now
+            # has its own dedicated bottom-row button, so Session has nothing
+            # left to fall back to — dead rather than pulling up modulators.
+            # Still feed the gesture object so its press/hold timing stays
+            # sane for the next time performance mode is actually available.
+            if pressed:
+                self._performance_gesture.press(self._now())
+            else:
+                self._performance_gesture.release()
+            return False
         if pressed:
             now = self._now()
             if self._performance_gesture.tap_tap(now):
@@ -1012,7 +1302,11 @@ class LaunchpadSurface:
         self._finish_mode_switch()
 
     def _cycle_note_modes(self) -> None:
-        """Note key cycle: Note → Custom → Note (skips Custom if none loaded)."""
+        """Note key cycle: Note → Custom → Note (skips Custom if none loaded).
+        Pro devices: Note is a dedicated button (Custom has its own User key),
+        so it never cycles away from Note."""
+        if self.device_family in (DEVICE_FAMILY_LPP, DEVICE_FAMILY_LPP3):
+            return
         if self.surface_mode == MODE_CUSTOM:
             self._enter_note_mode()
         elif self._custom_modes:
@@ -1024,7 +1318,15 @@ class LaunchpadSurface:
         # family's last member immediately on press (so a long-hold lands on a
         # live note-family surface). Long-hold (on_idle): Note settings pane.
         if pressed:
-            entered_from_outside = self.surface_mode not in (MODE_NOTE, MODE_CUSTOM)
+            # Pro devices: Note is dedicated, so Custom (now reached via the
+            # separate User key) counts as "outside" too, unlike the stock
+            # Note<->Custom family used elsewhere.
+            note_family = (
+                (MODE_NOTE,)
+                if self.device_family in (DEVICE_FAMILY_LPP, DEVICE_FAMILY_LPP3)
+                else (MODE_NOTE, MODE_CUSTOM)
+            )
+            entered_from_outside = self.surface_mode not in note_family
             if entered_from_outside:
                 self._enter_mode_family_last("note")
             self._note_gesture.press(self._now(), context=entered_from_outside)
@@ -1055,6 +1357,19 @@ class LaunchpadSurface:
         # left blank. Sent after the refresh so it overlays the painted grid.
         self._maybe_scroll_fpc_placeholder()
 
+    def _handle_step_seq_button(self, pressed: bool) -> None:
+        """Pro devices' dedicated Step Sequencer button. Tap enters Step
+        Sequencer; long-hold (on_idle, via _poll_button_holds) opens its
+        settings pane — the same gesture that used to live on the Device/FPC
+        button before Step Sequencer got its own key."""
+        if pressed:
+            self._step_seq_gesture.press(self._now())
+            return
+        released = self._step_seq_gesture.release()
+        if not released.was_pressed or released.hold_fired:
+            return
+        self._enter_step_sequencer_mode()
+
     def _handle_fpc_mode_button(self, pressed: bool, _event) -> None:
         # Tap: cycle FPC → Step Sequencer → Gross Beat → FPC (Gross Beat
         # skipped when no Gross Beat plugin is focused); from another surface,
@@ -1070,6 +1385,12 @@ class LaunchpadSurface:
 
     def _fpc_cycle_step(self) -> None:
         gb_id = self._focused_plugin_pad_override_id()
+        if self.device_family in (DEVICE_FAMILY_LPP, DEVICE_FAMILY_LPP3):
+            # Pro devices: Device is a dedicated FPC button (Step Sequencer
+            # has its own bottom-row button now), so it never cycles onward.
+            if self.surface_mode != MODE_FPC:
+                self._enter_fpc_mode(suppress_gross_beat=True)
+            return
         if self.surface_mode == MODE_FPC:
             gb_overlay_active = gb_id is not None and self._suppressed_plugin_override_id != gb_id
             if gb_overlay_active:
@@ -1164,15 +1485,9 @@ class LaunchpadSurface:
             if mode is not None and self._custom_mode_is_blackout(mode):
                 return True
         return False
-    def _custom_mode_index_for_selector_slot(self, slot: int) -> int | None:
-        return cm.index_for_selector_slot(self, slot)
     # Custom-mode pad handling
     def _handle_custom_mode_pad(self, event, pad: int, velocity: int, pressed: bool) -> bool:
         return cm.handle_pad(self, event, pad, velocity, pressed)
-    def _handle_custom_locked_note(self, pad: int, cp, velocity: int, pressed: bool) -> bool:
-        return cm.handle_locked_note(self, pad, cp, velocity, pressed)
-    def _handle_custom_fader_pad(self, event, pad: int, fader: cm.CustomFader, slot: int) -> bool:
-        return cm.handle_fader_pad(self, event, pad, fader, slot)
 
     def _process_xy_cc(self, event, cc: int, value: int) -> None:
         """Emit a generated XY CC for FL to process or learn (used by faders)."""
@@ -1249,6 +1564,38 @@ class LaunchpadSurface:
     def _xy_page(self) -> int:
         return int(self.state.get("xy_page", XY_PAGE_XY)) % XY_PAGE_COUNT
 
+    def _xy_pad_cc_pair(self) -> tuple[int, int]:
+        return XY_PAD_CC_PAIRS[self._xy_pad_index % len(XY_PAD_CC_PAIRS)]
+
+    def _xy_pad_hue(self, offset: int = 0) -> int:
+        """Palette hue for the active XY pad or a wrapping neighbour."""
+        return XY_PAD_ACTIVE_HUES[
+            (self._xy_pad_index + int(offset)) % len(XY_PAD_ACTIVE_HUES)
+        ]
+
+    def _handle_xy_pad_cycle(self, cc: int, pressed: bool) -> bool:
+        """Left/right on the positional XY page cycle among the 4 parallel XY
+        pads. Wraps rather than clamping — there's no natural "end" among 4
+        equally-weighted pads. Inert on the Vert/Horiz(-bipolar) fader pages
+        and everywhere outside MODE_XY_PAD. Returns True if consumed."""
+        if self.surface_mode != MODE_XY_PAD or self._xy_page() != XY_PAGE_XY:
+            return False
+        if cc not in (self._top_pan_left, self._top_pan_right):
+            return False
+        if pressed:
+            # Bank the outgoing pad's cursor into its own slot before
+            # switching, then load the incoming pad's own remembered position
+            # — each pad keeps its own last position independently.
+            self._xy_pad_positions[self._xy_pad_index] = [
+                self._xy_last_x_val if self._xy_last_x_val is not None else 0,
+                self._xy_last_y_val if self._xy_last_y_val is not None else 127,
+            ]
+            direction = 1 if cc == self._top_pan_right else -1
+            self._xy_pad_index = (self._xy_pad_index + direction) % len(XY_PAD_CC_PAIRS)
+            self._xy_last_x_val, self._xy_last_y_val = self._xy_pad_positions[self._xy_pad_index]
+            self._save_state()
+        return True
+
     def _performance_modwheel_on(self) -> bool:
         return bool(self.state.get("performance_modwheel", False))
 
@@ -1268,14 +1615,14 @@ class LaunchpadSurface:
                 self._refresh_needed = True
             return True
 
-        if xp.pad_to_xy(pad) is None:
+        if ps.pad_to_xy(pad) is None:
             return True
 
         # Grid pads — dispatch by page
         if page == XY_PAGE_XY:
             if pressed:
-                xy = xp.pad_to_xy(pad)
-                x_val, y_val = xp.xy_values(*xy)
+                xy = ps.pad_to_xy(pad)
+                x_val, y_val = ps.xy_values(*xy)
                 # Send only the axes whose value actually changed, so a same-row
                 # press emits X alone, a same-column press emits Y alone, and
                 # re-pressing the current pad sends nothing.
@@ -1293,21 +1640,22 @@ class LaunchpadSurface:
                     self._xy_last_x_val = x_val
                 if y_changed:
                     self._xy_last_y_val = y_val
+                x_cc, y_cc = self._xy_pad_cc_pair()
                 learn_slot_used = False
                 if x_changed:
                     learn_slot_used = self._emit_xy_axis(
-                        event, XY_PAD_X_CC, x_val, allow_learn=True
+                        event, x_cc, x_val, allow_learn=True
                     )
                 if y_changed:
                     self._emit_xy_axis(
-                        event, XY_PAD_Y_CC, 127 - y_val,
+                        event, y_cc, 127 - y_val,
                         allow_learn=not learn_slot_used,
                     )
                 self.active_pads[pad] = ("xy_pad", pad)
             else:
                 self.active_pads.pop(pad, None)
         else:
-            cc = xp.grid_fader_cc(pad, page)
+            cc = ps.grid_fader_cc(pad, page)
             if cc is None:
                 return True
             if pressed:
@@ -1317,6 +1665,8 @@ class LaunchpadSurface:
                 self.active_pads.pop(pad, None)
 
         self._refresh_needed = True
+        if pressed:
+            self._save_state()
         return True
 
     def _xy_apply_fader(self, event, cc: int, pad: int, pad_fader: PadFader | None = None) -> None:
@@ -1406,12 +1756,13 @@ class LaunchpadSurface:
             return ps.selector_lighting(pad, page, XY_PAGE_COUNT)
         # Grid pads
         if page == XY_PAGE_XY:
-            return xp.xy_grid_lighting(
+            return ps.xy_grid_lighting(
                 pad,
                 self._xy_last_x_val,
                 self._xy_last_y_val,
+                self._xy_pad_hue(),
             )
-        cc = xp.grid_fader_cc(pad, page)
+        cc = ps.grid_fader_cc(pad, page)
         if cc is None:
             return LedColor(PAD_DISABLED)
         return self._fader_pad_lighting(
@@ -1474,9 +1825,6 @@ class LaunchpadSurface:
     _LOCK_PAGE_VOLUME_ROW = tuple(range(21, 29))    # channel volume
     _LOCK_PAGE_PAN_ROW = tuple(range(11, 19))       # channel pan
 
-    def _step_lock_page_context_for_pad(self, pad: int) -> str | None:
-        return ss.lock_page_context_for_pad(pad)
-
     def _handle_step_lock_page_press(self, pad: int) -> list[int]:
         return ss.handle_lock_page_press(self, pad)
 
@@ -1525,10 +1873,6 @@ class LaunchpadSurface:
         return po.active_override(self)
     def _focused_plugin_pad_override_id(self) -> str | None:
         return po.focused_override_id()
-    def _focused_plugin_name(self) -> str:
-        return po.focused_plugin_name()
-    def _plugin_window_focused(self) -> bool:
-        return po.plugin_window_focused()
     def _handle_plugin_pad_override(
         self, override_id: str, event, pad: int, velocity: int, pressed: bool
     ) -> bool:
@@ -1537,44 +1881,8 @@ class LaunchpadSurface:
         self, override_id: str, pad: int
     ) -> LedColor:
         return po.lighting(self, override_id, pad)
-    def _handle_gross_beat_pad(self, _event, pad: int, pressed: bool) -> bool:
-        return po.handle_gross_beat_pad(self, _event, pad, pressed)
-    def _gross_beat_lighting(self, pad: int) -> LedColor:
-        return po.gross_beat_lighting(self, pad)
     def _gross_beat_slot_mode(self) -> str:
         return po.gross_beat_slot_mode(self)
-    def _focused_plugin_target(self) -> tuple[int, int, int] | None:
-        return po.focused_plugin_target()
-    def _gross_beat_spec(self, target: tuple[int, int, int] | None) -> dict | None:
-        return po.gross_beat_spec(self, target)
-    def _discover_gross_beat_spec(self, param_names: list[str]) -> dict | None:
-        return po.discover_gross_beat_spec(param_names)
-    def _normalize_param_name(self, name: str) -> str:
-        return po.normalize_param_name(name)
-    def _extract_slot_number(self, normalized_name: str) -> int | None:
-        return po.extract_slot_number(normalized_name)
-    def _gross_beat_trigger_slot(
-        self,
-        target: tuple[int, int, int],
-        spec: dict,
-        slot_index: int,
-    ) -> None:
-        po.gross_beat_trigger_slot(target, spec, self._gross_beat_slot_mode(), slot_index)
-    def _gross_beat_active_slot(
-        self,
-        target: tuple[int, int, int] | None,
-        spec: dict | None,
-    ) -> int | None:
-        return po.gross_beat_active_slot(target, spec, self._gross_beat_slot_mode())
-    def _plugin_param_value(self, target: tuple[int, int, int], param_index: int) -> float:
-        return po.plugin_param_value(target, param_index)
-    def _plugin_set_param_value(
-        self,
-        target: tuple[int, int, int],
-        param_index: int,
-        value: float,
-    ) -> None:
-        po.plugin_set_param_value(target, param_index, value)
     # LED rendering
     def _refresh_surface(self) -> None:
         # Note-key pulse when Note mode is channel-locked.
@@ -1588,7 +1896,7 @@ class LaunchpadSurface:
         custom_pulse_pads = (
             self._locked_custom_selector_pads()
             if self.surface_mode == MODE_CUSTOM
-            and self.device_family not in (DEVICE_FAMILY_MK2, DEVICE_FAMILY_MK1)
+            and self.device_family not in SOFTWARE_PULSE_FAMILIES
             and not lights_out
             else set()
         )
@@ -1602,7 +1910,7 @@ class LaunchpadSurface:
             pulse_top_ccs={self._top_note_mode} if note_lock_pulse else None,
             pulse_grid_pads=custom_pulse_pads or None,
         )
-        if note_lock_pulse and self.device_family not in (DEVICE_FAMILY_MK2, DEVICE_FAMILY_MK1):
+        if note_lock_pulse and self.device_family not in SOFTWARE_PULSE_FAMILIES:
             led_display.send_top_led_pulse(self._top_note_mode, LP3_MENU_LOCKED)
         for pad in custom_pulse_pads:
             # Side column is CC on LP3, so the CC-channel-3 pulse path applies.
@@ -1627,20 +1935,8 @@ class LaunchpadSurface:
             int(round(fb * brightness)),
         )
         led_display.send_top_led_rgb(self._top_note_mode, rgb)
-    def _custom_slot_display_index(self, slot: int) -> int | None:
-        return cm.slot_display_index(self, slot)
     def _custom_mode_lighting(self, pad: int) -> LedColor:
         return cm.lighting(self, pad)
-    def _custom_fader_lighting(
-        self,
-        pad_fader: PadFader,
-        fader: cm.CustomFader,
-        pad: int,
-        current_value: float,
-    ) -> LedColor:
-        return self._fader_pad_lighting(
-            pad_fader, fader.on_color, fader.off_color, pad, current_value
-        )
     def _step_sequencer_grid_visible(self) -> bool:
         """True when the step-sequencer grid (ss.lighting) is the active grid:
         Step Seq mode (outside the lock page), or the Session fallback when FL
@@ -1658,6 +1954,8 @@ class LaunchpadSurface:
         then the active mode's lighting via _grid_lighting_for_mode."""
         if self._lights_effectively_out():
             return LedColor(PAD_DISABLED)
+        if self._routing_page_visible and self._routing_page_available():
+            return self._routing_page_lighting(pad)
         if self.settings_visible:
             if self._note_routing_gesture.hold_fired and self._step_lock_page_channel is not None:
                 return self._step_lock_page_lighting(pad)
@@ -1666,6 +1964,104 @@ class LaunchpadSurface:
         if handler is None:
             return LedColor(PAD_DISABLED)
         return handler(pad)
+
+    _ROUTING_PAGE_DIM = 0.06
+
+    def _routing_page_offset(self) -> int:
+        """Current scroll position, re-clamped on read so a rack that shrank
+        can't strand the view past the end of the channel list."""
+        try:
+            count = channels.channelCount()
+        except Exception:
+            count = 0
+        maximum = cl.routing_page_max_offset(count)
+        offset = int(self.state.get("routing_page_offset", 0))
+        return max(0, min(maximum, offset))
+
+    def _step_routing_page(self, cc: int) -> None:
+        """Scroll the routing window: up/down by one row, left/right by a
+        whole page."""
+        if cc == self._top_octave_up:
+            delta = -cl.ROUTING_PAGE_ROW
+        elif cc == self._top_octave_down:
+            delta = cl.ROUTING_PAGE_ROW
+        elif cc == self._top_pan_left:
+            delta = -cl.ROUTING_PAGE_CHANNELS
+        elif cc == self._top_pan_right:
+            delta = cl.ROUTING_PAGE_CHANNELS
+        else:
+            return
+        try:
+            count = channels.channelCount()
+        except Exception:
+            count = 0
+        maximum = cl.routing_page_max_offset(count)
+        self.state["routing_page_offset"] = max(
+            0, min(maximum, self._routing_page_offset() + delta)
+        )
+
+    def _routing_page_arrow_color(self, cc: int):
+        """Arrow LED for the routing page: lit when that direction can still
+        scroll. Returns None for non-arrow CCs so the caller falls through."""
+        offset = self._routing_page_offset()
+        try:
+            count = channels.channelCount()
+        except Exception:
+            count = 0
+        maximum = cl.routing_page_max_offset(count)
+        if cc in (self._top_octave_up, self._top_pan_left):
+            return LP3_ARROW_OCTAVE_ACTIVE if offset > 0 else LP3_ARROW_INACTIVE
+        if cc in (self._top_octave_down, self._top_pan_right):
+            return LP3_ARROW_OCTAVE_ACTIVE if offset < maximum else LP3_ARROW_INACTIVE
+        return None
+
+    def _routing_page_lighting(self, pad: int) -> LedColor:
+        """Channel-routing overlay: each 8x8 pad is one rack channel from the
+        current scroll window, painted in its plugin colour — dim when not
+        routed, full brightness when the current page feeds it."""
+        channel = cl.routing_page_channel_for_pad(pad, self._routing_page_offset())
+        if channel is None:
+            # Side column: no channel maps here.
+            return LedColor(PAD_DISABLED)
+        try:
+            exists = channel < channels.channelCount()
+        except Exception:
+            exists = False
+        if not exists:
+            return LedColor(PAD_DISABLED)
+        routed = cl.is_routed(self.state, self._lock_context(), channel)
+        rgb = ss.channel_rgb(channel)
+        if rgb is None:
+            # No usable plugin colour — fall back to the menu palette so the
+            # pad still reads as present/routed.
+            return LedColor(LP3_MENU_ACTIVE if routed else LP3_MENU_INACTIVE)
+        if routed:
+            return LedColor(PAD_DISABLED, rgb)
+        maximum = led_display.rgb_max_value()
+        dim = tuple(
+            max(0, min(maximum, int(round(component * self._ROUTING_PAGE_DIM))))
+            for component in rgb
+        )
+        return LedColor(PAD_DISABLED, dim)
+
+    def _handle_routing_page_press(self, pad: int) -> bool:
+        """Toggle one channel in the current page's routing set. Returns True
+        if the press was consumed."""
+        channel = cl.routing_page_channel_for_pad(pad, self._routing_page_offset())
+        if channel is None:
+            return True
+        try:
+            if channel >= channels.channelCount():
+                return True
+        except Exception:
+            return True
+        routed = cl.toggle_route(self.state, self._lock_context(), channel)
+        self._save_state()
+        _log(
+            f"routing {self._lock_context()} channel {channel} "
+            f"{'on' if routed else 'off'}"
+        )
+        return True
 
     def _step_seq_grid_lighting(self, pad: int) -> LedColor:
         if self._step_seq_settings_visible:
@@ -1703,6 +2099,14 @@ class LaunchpadSurface:
             return self._plugin_pad_override_lighting(override_id, pad)
         return self._custom_mode_lighting(pad)
 
+    def _mixer_grid_lighting(self, pad: int) -> LedColor:
+        return mv.lighting(pad, self._mixer_subpage, self._mixer_pulse_brightness())
+
+    def _mixer_pulse_brightness(self) -> float:
+        return led_display.software_pulse_brightness(
+            (time.monotonic() - self._pulse_start) % 2.0 / 2.0
+        )
+
     def _fpc_grid_lighting(self, pad: int) -> LedColor:
         override_id = self._active_plugin_pad_override()
         if override_id is not None:
@@ -1738,6 +2142,23 @@ class LaunchpadSurface:
         # LedColor (top CCs don't yet set explicit MK1 values).
         if self._lights_effectively_out():
             return PAD_DISABLED
+        shortcut_slot = self._view_shortcut_ccs.get(cc)
+        if shortcut_slot is not None:
+            shortcuts = self.state.get("view_shortcuts", [])
+            target = shortcuts[shortcut_slot] if shortcut_slot < len(shortcuts) else None
+            return LP3_MENU_ACTIVE if isinstance(target, dict) else LP3_MENU_INACTIVE
+        if self._routing_page_visible:
+            arrow_color = self._routing_page_arrow_color(cc)
+            if arrow_color is not None:
+                return arrow_color
+        if (
+            self.surface_mode == MODE_XY_PAD
+            and self._xy_page() == XY_PAGE_XY
+            and cc in (self._top_pan_left, self._top_pan_right)
+        ):
+            # Both directions wrap, so each arrow previews the hue of the XY
+            # pad it will select rather than using a generic navigation color.
+            return self._xy_pad_hue(-1 if cc == self._top_pan_left else 1)
         if cc == self._top_octave_down:
             if self.surface_mode == MODE_XY_PAD:
                 page = self._xy_page()
@@ -1855,7 +2276,9 @@ class LaunchpadSurface:
                 if bool(self.state.get("performance_direct_audio", False)):
                     return LP3_PERFORMANCE_HYBRID
                 return LP3_MENU_ACTIVE
-            if self.surface_mode == MODE_XY_PAD:
+            if self.surface_mode == MODE_XY_PAD and not self._is_pro_device():
+                # Pro devices: modulators moved to their own bottom-row
+                # button, so Session no longer lights for MODE_XY_PAD.
                 return LP3_MENU_ACTIVE
             if pm.performance_available():
                 return LP3_PERFORMANCE_READY
@@ -1863,13 +2286,34 @@ class LaunchpadSurface:
         if cc == self._top_note_mode:
             if cl.is_locked(self.state, cl.NOTE_CONTEXT):
                 return LP3_MENU_LOCKED
-            return LP3_MENU_ACTIVE if self.surface_mode in (MODE_NOTE, MODE_CUSTOM) else LP3_MENU_INACTIVE
+            # Pro devices: Custom moved to its own User button, so Note no
+            # longer lights for MODE_CUSTOM.
+            note_modes = (MODE_NOTE,) if self._is_pro_device() else (MODE_NOTE, MODE_CUSTOM)
+            return LP3_MENU_ACTIVE if self.surface_mode in note_modes else LP3_MENU_INACTIVE
         if cc == self._top_fpc_mode:
-            if self.surface_mode in (MODE_FPC, MODE_STEP_SEQ):
+            # Pro devices: Step Sequencer moved to its own bottom-row button,
+            # so Device no longer lights for MODE_STEP_SEQ.
+            fpc_modes = (MODE_FPC,) if self._is_pro_device() else (MODE_FPC, MODE_STEP_SEQ)
+            if self.surface_mode in fpc_modes:
                 return LP3_MENU_ACTIVE
             return LP3_MENU_INACTIVE
         if cc == self._top_record_arm:
             return LP3_MENU_ACTIVE if transport.isRecording() else LP3_MENU_INACTIVE
+        if cc == self._top_custom_mode:
+            return LP3_MENU_ACTIVE if self.surface_mode == MODE_CUSTOM else LP3_MENU_INACTIVE
+        if cc == self._top_step_seq:
+            return LP3_MENU_ACTIVE if self.surface_mode == MODE_STEP_SEQ else LP3_MENU_INACTIVE
+        if cc == self._top_modulators:
+            return LP3_MENU_ACTIVE if self.surface_mode == MODE_XY_PAD else LP3_MENU_INACTIVE
+        if cc == self._top_routing:
+            # Unlit entirely outside note/custom pages, where it does nothing.
+            if not self._routing_page_available():
+                return PAD_DISABLED
+            return LP3_MENU_ACTIVE if self._routing_page_visible else LP3_MENU_INACTIVE
+        if cc == self._top_mixer:
+            return LP3_MENU_ACTIVE if self.surface_mode == MODE_MIXER else LP3_MENU_INACTIVE
+        if cc == self._top_mixer_arm:
+            return mv.arm_control_lighting(self._mixer_pulse_brightness()) if self.surface_mode == MODE_MIXER else PAD_DISABLED
         return LP3_MENU_INACTIVE
     # Note mapping
     def _note_for_pad(self, pad: int) -> int:
@@ -1900,10 +2344,24 @@ class LaunchpadSurface:
         if self.surface_mode == MODE_PERFORMANCE and not pm.performance_available():
             return cl.STEP_CONTEXT
         return cl.NOTE_CONTEXT
+    def _routing_page_available(self) -> bool:
+        """The routing page only applies to pages that have their own routing
+        context: note mode and the 16 custom modes."""
+        return self.surface_mode in (MODE_NOTE, MODE_CUSTOM) and not self.settings_visible
+
+    def _route_targets(self, host_channel: int) -> list[int]:
+        """Channels the current page's notes should reach for *host_channel*.
+
+        Only note/custom pages fan out; every other surface keeps its existing
+        single-target behaviour so FPC banks, the step sequencer and
+        performance pads are untouched.
+        """
+        if self.surface_mode not in (MODE_NOTE, MODE_CUSTOM):
+            return [host_channel] if host_channel >= 0 else []
+        return cl.route_targets(self.state, self._lock_context(), host_channel)
+
     def _selected_channel(self) -> int:
         return cl.resolve(self.state, self._lock_context(), self._host_selected_channel())
-    def _channel_lock_enabled(self) -> bool:
-        return cl.is_locked(self.state, self._lock_context())
     # Active-note tracking
     def _is_note_active(self, channel_index: int, note: int) -> bool:
         return self.active_notes.get((channel_index, note), 0) > 0
@@ -1933,15 +2391,25 @@ class LaunchpadSurface:
         else:
             self.active_notes[key] = count - 1
     def _release_all_notes(self) -> None:
-        for pad_info in self.active_pads.values():
+        midi_channel = int(self.state["midi_channel"])
+        # Multi-routed pads own every target they opened, including the primary
+        # one mirrored into active_pads — release them here and skip those pads
+        # below so the primary isn't sent a redundant second note-off.
+        for routed in self._pad_routed_notes.values():
+            for channel_index, note in routed:
+                channels.midiNoteOn(channel_index, note, 0, midi_channel)
+        for pad, pad_info in self.active_pads.items():
+            if pad in self._pad_routed_notes:
+                continue
             if isinstance(pad_info, tuple) and len(pad_info) == 2:
                 first, second = pad_info
                 if first != "xy_pad":
                     channel_index, note = first, second
                     channels.midiNoteOn(
                         channel_index, note, 0,
-                        int(self.state["midi_channel"]),
+                        midi_channel,
                     )
+        self._pad_routed_notes.clear()
         self.active_pads.clear()
         self.active_notes.clear()
         self._fpc_active_pad_order.clear()
@@ -1966,8 +2434,19 @@ class LaunchpadSurface:
             return SIDE_COLUMN_PADS
         return ()
     def _apply_surface_layout(self) -> None:
-        if self.device_family in (DEVICE_FAMILY_LPX, DEVICE_FAMILY_LPM3):
+        if self.device_family in PROGRAMMER_MODE_FAMILIES:
             layout = LP3_PROGRAMMER_MODE
+            # LPP reaches Programmer via a two-message Standalone+layout
+            # handshake. Unconditionally resending it on every mode switch was
+            # tried as a safety net against a dropped message or the hardware
+            # Setup button undoing it, but the handshake itself is briefly
+            # visible on the original Pro (a single-frame flash of the stock
+            # Note-layout colours while Standalone mode is re-armed) — with the
+            # Pro's mode buttons now switching surface mode much more often,
+            # that flash became constant. Cache like every other device
+            # instead; the dropped-message case is rare and self-correcting
+            # (the next mode switch after reconnect resends it anyway, since
+            # _active_layout resets to None in on_init).
             if self._active_layout != layout:
                 led_display.set_layout(layout)
                 self._grid_led_cache.clear()
@@ -2015,6 +2494,12 @@ class LaunchpadSurface:
         self._save_state()
         _log("step sequencer mode")
 
+    def _enter_mixer_mode(self) -> None:
+        self._begin_mode_switch(MODE_MIXER)
+        self._mixer_subpage = 0
+        self._finish_mode_switch(refresh=True)
+        _log("mixer mode")
+
     def _restore_surface_mode(self) -> None:
         """Restore the surface mode saved in state, falling back to Note mode."""
         self._restoring_mode = True
@@ -2028,6 +2513,8 @@ class LaunchpadSurface:
                 self._enter_xy_pad_mode()
             elif mode == MODE_STEP_SEQ:
                 self._enter_step_sequencer_mode()
+            elif mode == MODE_MIXER:
+                self._enter_mixer_mode()
             elif mode == MODE_CUSTOM:
                 saved_index = int(self.state.get("custom_mode_index", 0))
                 if self._custom_modes:
@@ -2040,9 +2527,6 @@ class LaunchpadSurface:
         finally:
             self._restoring_mode = False
 
-    def _send_mk1_duty_cycle(self) -> None:
-        dp.send_mk1_duty_cycle()
-
     def _enter_session_default(self) -> None:
         """Session key default surface: Performance when FL performance mode is
         on, otherwise the XY/faders page."""
@@ -2053,10 +2537,18 @@ class LaunchpadSurface:
 
     def _cycle_session_modes(self) -> None:
         """Session key cycle.
-        Performance available: Performance ↔ XY/faders.
+        On Pro devices, Performance is dedicated to Session and Modulators has
+        its own bottom-row button, so Session stays on/returns to Performance.
+        Other devices cycle Performance ↔ XY/faders when available.
         Performance unavailable: XY/faders only.
         (Step sequencer now lives on the FPC key.)
         """
+        if self._is_pro_device():
+            if pm.performance_available():
+                self._enter_performance_mode()
+            else:
+                self._enter_xy_pad_mode()
+            return
         if pm.performance_available() and self.surface_mode == MODE_PERFORMANCE:
             self._enter_xy_pad_mode()
         else:
@@ -2095,23 +2587,46 @@ class LaunchpadSurface:
         if self._launch_map_ready:
             self._launch_map_ready = pm.update_launch_map(self._launch_map_ready)
     # State persistence
-    def _load_state(self) -> None:
+    def _load_state(self) -> bool:
         self.state, file_missing = state_io.load_state(self.state_path, self.midi_port)
-        for warning in state_io.pop_warnings():
-            _log(f"state warning: {warning}")
         cl.migrate_legacy(self.state)
         if file_missing:
-            _log("state file not found, creating with defaults")
-            self._save_state()
+            _log("state file not found; defaults will be saved after project state is merged")
+        return file_missing
+
+    def _log_state_warnings(self) -> None:
+        for warning in state_io.pop_warnings():
+            _log(f"state warning: {warning}")
+
+    def _apply_loaded_state(self) -> None:
+        """Copy validated persisted values into the surface's runtime caches."""
+        saved_custom_index = int(self.state.get("custom_mode_index", 0))
+        if self._custom_modes:
+            self._custom_mode_index = max(0, min(len(self._custom_modes) - 1, saved_custom_index))
+        if self._live_custom_mode_reading and saved_custom_index >= len(self._custom_modes):
+            self._pending_custom_mode_index = saved_custom_index
+        self._xy_pad_positions = [[0, 127] for _ in range(len(XY_PAD_CC_PAIRS))]
+        saved_positions = self.state.get("xy_cursor_positions", ())
+        for i, pair in enumerate(saved_positions[:len(self._xy_pad_positions)]):
+            try:
+                self._xy_pad_positions[i] = [int(pair[0]), int(pair[1])]
+            except (TypeError, ValueError, IndexError):
+                pass
+        self._xy_last_x_val, self._xy_last_y_val = self._xy_pad_positions[self._xy_pad_index]
+        self._xy_fader_values = dict(self._xy_fader_default_values)
+        for key, value in self.state.get("xy_fader_values", {}).items():
+            try:
+                self._xy_fader_values[int(key)] = float(value)
+            except (ValueError, TypeError):
+                pass
     def _save_state(self) -> None:
         if self._restoring_mode:
             return
         self.state["surface_mode"] = self.surface_mode
         self.state["custom_mode_index"] = self._custom_mode_index
-        if self._xy_last_x_val is not None:
-            self.state["xy_cursor_x"] = self._xy_last_x_val
-        if self._xy_last_y_val is not None:
-            self.state["xy_cursor_y"] = self._xy_last_y_val
+        if self._xy_last_x_val is not None and self._xy_last_y_val is not None:
+            self._xy_pad_positions[self._xy_pad_index] = [self._xy_last_x_val, self._xy_last_y_val]
+        self.state["xy_cursor_positions"] = [list(pair) for pair in self._xy_pad_positions]
         self.state["xy_fader_values"] = {str(k): v for k, v in self._xy_fader_values.items()}
         state_io.save_state(self.state_path, self.midi_port, self.state)
         state_io.save_flp_state(self.midi_port, self.state)

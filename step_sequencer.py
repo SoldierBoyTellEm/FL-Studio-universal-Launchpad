@@ -472,9 +472,13 @@ def _channel_rgb_uncorrected(channel_index: int) -> tuple[int, int, int] | None:
         return None
     if color == 0:
         return None
-    red = color & 0xFF
+    # FL packs channel colour as 0x00RRGGBB read low-to-high as blue, green,
+    # red (matching led_display.rgb6_from_color's extraction) — this used to
+    # read red and blue from the wrong ends, swapping them everywhere this
+    # feeds into: the channel rack/step sequencer view and the routing page.
+    blue = color & 0xFF
     green = (color >> 8) & 0xFF
-    blue = (color >> 16) & 0xFF
+    red = (color >> 16) & 0xFF
     if (red, green, blue) == DEFAULT_FL_CHANNEL_RGB:
         return (0xFF, 0xFF, 0xFF)
     return (red, green, blue)
@@ -491,6 +495,12 @@ def _channel_rgb(channel_index: int) -> tuple[int, int, int] | None:
         saturation=saturation,
         gamma=gamma,
     )
+
+def channel_rgb(channel_index: int) -> tuple[int, int, int] | None:
+    """Public accessor for a channel's tuned plugin colour, for surfaces
+    outside the step sequencer that paint pads by channel (e.g. the routing
+    page). Returns None when the channel has no usable colour."""
+    return _channel_rgb(channel_index)
 
 def _clamp(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))

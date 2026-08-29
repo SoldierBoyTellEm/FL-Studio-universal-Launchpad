@@ -481,8 +481,13 @@ def xy_grid_lighting(
     pad: int,
     cursor_x: int | None,
     cursor_y: int | None,
+    active_color: int = LP3_MENU_ACTIVE,
 ) -> LedColor:
-    """Crosshair lighting for the XY page: active row+column dim, intersection bright."""
+    """Crosshair lighting for the XY page: active row+column dim, intersection bright.
+
+    *active_color* lets a caller with several parallel XY pads (each its own
+    CC pair) give the intersection a distinct hue per pad, so which one is
+    currently active is visible at a glance."""
     xy = pad_to_xy(pad)
     if xy is None:
         return LedColor(PAD_DISABLED)
@@ -493,7 +498,7 @@ def xy_grid_lighting(
         on_col = pad_x == cursor_col
         on_row = pad_y == cursor_row
         if on_col and on_row:
-            return LedColor(LP3_MENU_ACTIVE)
+            return LedColor(active_color)
         if on_col or on_row:
             return LedColor(LP3_MENU_INACTIVE)
     return LedColor(PAD_DISABLED)

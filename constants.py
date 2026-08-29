@@ -2,6 +2,7 @@
 # Every magic number, colour constant, pad layout, and default state value
 # used across the script lives here.  Import with `from constants import *`
 # or name-specifically; nothing in this file has side-effects.
+from typing import NamedTuple
 
 # MK1 LED velocity encoding — Launchpad / Launchpad S / Mini MK1 / Mini MK2.
 #
@@ -100,8 +101,6 @@ def mk1_velocity_from_rg(two_digit: int) -> int:
 #
 # It is a tuple subclass, so it stays hashable for the LED caches and the old
 # (index, rgb) shape is still reachable as lc[0], lc[1].
-from typing import NamedTuple
-
 class LedColor(NamedTuple):
     index: int
     rgb: tuple = None
@@ -176,6 +175,19 @@ SYSEX_SCROLL    = 0x14
 LP3_SYSEX_SCROLL = 0x07
 # Default MK3 scroll speed in pads/second (MK2 has no speed byte).
 LP3_SCROLL_SPEED = 0x07
+# Launchpad Pro (original) Standalone-mode SysEx opcodes. Unlike MK2's single
+# SYSEX_LAYOUT toggle, LPP needs two separate messages: first force Standalone
+# mode (it can otherwise be sitting in Ableton/Live mode), then select the
+# Programmer layout, which is the addressable "blank canvas" equivalent of
+# MK2's User 2 / LPX's Programmer Mode. All other LED SysEx opcodes (set
+# LED, set LED RGB, light all, scroll) are identical to MK2's, just under a
+# different product-ID prefix (see LPP_SYSEX_PREFIX in device_profile.py).
+LPP_SYSEX_MODE_SELECT   = 0x21
+LPP_SYSEX_LAYOUT_SELECT = 0x2C
+LPP_MODE_ABLETON     = 0x00
+LPP_MODE_STANDALONE  = 0x01
+LPP_LAYOUT_NOTE       = 0x00
+LPP_LAYOUT_PROGRAMMER = 0x03
 # Palette colour for the "FPC" placeholder scroll. MUST be non-zero —
 # scroll colour 0 is "off", which scrolls the text invisibly. 0x03 is white.
 FPC_SCROLL_COLOR = 0x03
@@ -244,6 +256,7 @@ MODE_PERFORMANCE = "performance"
 MODE_CUSTOM      = "custom"
 MODE_XY_PAD      = "xy_pad"
 MODE_STEP_SEQ    = "step_seq"
+MODE_MIXER       = "mixer"
 MODE_BLANK       = "blank"
 
 # Note-range limits and timing constants
@@ -311,6 +324,7 @@ SETTINGS_GRID_PADS = tuple(
     for col in range(1, 9)
 )
 SIDE_COLUMN_PADS = tuple(row * 10 + 9 for row in range(1, 9))
+MIXER_PAGE_LAYOUTS = ("overview",)
 
 # Note mode: top row (81-88) plus its side-column pad (89) as a 9-wide
 # modwheel fader, left to right, toggled by MODWHEEL_ROW_SETTING_PAD.
@@ -400,6 +414,20 @@ LP3_ARROW_PAN_ACTIVE    = 0x34
 LP3_MENU_INACTIVE   = 0x01
 LP3_MENU_ACTIVE     = 0x1C
 LP3_MENU_LOCKED     = 0x34
+# The 4 parallel XY pads on the positional XY page (left/right arrows cycle
+# between them). CC pairs shift the pre-existing 102/103 pair down to the
+# 4th (last) slot rather than reassigning it, so a session that never
+# touches left/right — or a DAW mapping already pointed at 102/103 — keeps
+# working exactly as before, since index 3 is also the RAM-only default.
+# Hues: index 3 keeps the pre-existing crosshair colour (LP3_MENU_ACTIVE);
+# 45/53/5 (as given) mark the 3 new ones, in pad order.
+XY_PAD_CC_PAIRS = (
+    (96, 97),
+    (98, 99),
+    (100, 101),
+    (XY_PAD_X_CC, XY_PAD_Y_CC),
+)
+XY_PAD_ACTIVE_HUES = (45, 53, 5, LP3_MENU_ACTIVE)
 LP3_PERFORMANCE_READY  = 0x0D
 LP3_PERFORMANCE_HYBRID = 0x49
 LP3_CHROMATIC_DIM   = 0x07
@@ -420,7 +448,12 @@ NOTE_LOCK_PULSE_RGB = (57, 12, 63)
 NOTE_LOCK_PULSE_RGB_8BIT = (0xE5, 0x30, 0xFF)
 # FL Studio's default channel colour (warm tan) — used to detect unset channels
 # and substitute white instead of rendering the bland default.
-DEFAULT_FL_CHANNEL_RGB = (0xA5, 0x95, 0x78)
+# FL's default new-channel colour, as (red, green, blue). Previously recorded
+# as (0xA5, 0x95, 0x78) under the red/blue-swapped extraction that used to be
+# in step_sequencer.py's _channel_rgb_uncorrected; this is the same raw packed
+# colour split correctly, so the "treat FL's default colour as white" special
+# case there still fires after that fix.
+DEFAULT_FL_CHANNEL_RGB = (0x78, 0x95, 0xA5)
 # Scale definitions  (name, semitone intervals from root)
 SCALES = (
     ("Minor",             (0, 2, 3, 5, 7, 8, 10)),
@@ -449,6 +482,7 @@ STATE_FILE = "launchpad_unofficial_universal_state.json"
 # Keys stored per-FLP in playlist track 500's name rather than the JSON file.
 FLP_STATE_KEYS = frozenset({
     "channel_locks",
+    "channel_routes",
     "pan_offset",
     "fpc_page",
     "performance_modwheel",
@@ -461,7 +495,10 @@ FLP_STATE_KEYS = frozenset({
     "xy_page",
     "xy_cursor_x",
     "xy_cursor_y",
+    "xy_cursor_positions",
     "xy_fader_values",
+    "view_shortcuts",
+    "routing_page_offset",
 })
 
 DEFAULT_STATE = {
@@ -469,7 +506,15 @@ DEFAULT_STATE = {
     "custom_mode_index": 0,
     "xy_cursor_x": 0,
     "xy_cursor_y": 127,
+    # One [x, y] pair per parallel XY pad (see XY_PAD_CC_PAIRS), so each
+    # remembers its own last position independently. Absent in state files
+    # saved before this existed; on_init falls back to seeding all 4 slots
+    # from the single legacy xy_cursor_x/xy_cursor_y pair above in that case.
+    "xy_cursor_positions": [[0, 127] for _ in range(4)],
     "xy_fader_values": {},
+    # Eight Pro MK3 view shortcuts. A long-press stores the current surface
+    # and its page/view state; a tap restores it. None means unassigned.
+    "view_shortcuts": [None] * 8,
     "root": 0,
     "scale_index": 1,
     "chromatic": False,
@@ -480,6 +525,8 @@ DEFAULT_STATE = {
     "midi_channel": 0,
     "locked_channel": -1,
     "channel_locks": {},
+    "channel_routes": {},
+    "routing_page_offset": 0,
     "pan_offset": 0,
     "performance_track_offset": 1,
     "performance_block_offset": 0,
@@ -806,6 +853,7 @@ LP3_PALETTE_RGB = (
 PALETTE_RGB_BY_FAMILY: dict[str, tuple] = {
     "mk1":  MK2_PALETTE_RGB,
     "mk2":  MK2_PALETTE_RGB,
+    "lpp":  MK2_PALETTE_RGB,
     "lp3":  LP3_PALETTE_RGB,
     "lpx":  LP3_PALETTE_RGB,
     "lpm3": LP3_PALETTE_RGB,

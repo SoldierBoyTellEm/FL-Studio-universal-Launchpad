@@ -293,6 +293,22 @@ def has_any_fpc_slot_assignment(state: dict) -> bool:
             return True
     return False
 
+def has_any_valid_fpc_slot_assignment(state: dict) -> bool:
+    """Like has_any_fpc_slot_assignment, but also confirms each mapped slot's
+    channel is still a live FPC-capable channel.
+
+    has_any_fpc_slot_assignment only looks at the raw saved slot data, so a
+    slot left pointing at a deleted or no-longer-FPC channel after a
+    channel-rack edit still counts as "mapped" there. slot_assignment_for_index
+    already re-validates the channel via selected_channel_is_fpc, so reusing
+    it here is what makes this check "valid" rather than merely "present".
+    """
+    slot_channels = state.get("fpc_slot_channels", [-1] * 16)
+    for i in range(len(slot_channels)):
+        if slot_assignment_for_index(state, i) is not None:
+            return True
+    return False
+
 def auto_assign_new_fpc(state: dict, channel_index: int) -> None:
     """Assign channel_index to the lower two quadrants (2 and 3) on page 0,
     bank A (offset 0) for quadrant 2 and bank B (offset 16) for quadrant 3."""

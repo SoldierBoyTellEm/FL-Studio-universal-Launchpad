@@ -32,8 +32,16 @@
 #   Pad control 8 bytes: channelAndBehaviour offColor onColor(?) ?
 #                        ? ? ? note
 from __future__ import annotations
+import time
 from pathlib import Path
 from typing import Iterator
+from fl_stubs import channels, device
+import channel_lock as cl
+import led_display
+import modulators as ps
+from modulators import PadFader
+from constants import LP3_MENU_INACTIVE, PAD_DISABLED, LedColor
+from device_profile import DEVICE_FAMILY_LPM3, DEVICE_FAMILY_LPX
 # Public types
 MSG_OFF  = 0
 MSG_NOTE = 1
@@ -263,18 +271,22 @@ def _parse_format_b(msg: bytes) -> CustomMode | None:
         # Single-byte value containers
         if ctype == 0:   # onColor
             on_color = containers[i + 1] & 0x7F
-            i += 2; continue
+            i += 2
+            continue
         if ctype in (1, 2, 4, 5, 6, 7, 8):
-            i += 2; continue
+            i += 2
+            continue
         # Name container (type 32 = 0x20)
         if ctype == 32:
             length = containers[i + 1]
             name = containers[i + 2:i + 2 + length].decode("ascii", errors="replace")
-            i += 2 + length; continue
+            i += 2 + length
+            continue
         # Metadata container (type 33 = 0x21) – ignored
         if ctype == 33:
             length = containers[i + 1]
-            i += 2 + length; continue
+            i += 2 + length
+            continue
         # Control containers: top 2 bits = 01 (i.e. 64 == 96 & ctype)
         if 64 == (96 & ctype):
             length    = ctype & 0x1F
@@ -460,15 +472,6 @@ def load_live_then_static(script_dir: Path, live_slots: set[int] | None = None) 
     return [modes_by_slot[slot] for slot in range(_MAX_TOTAL_SLOTS) if slot in modes_by_slot]
 
 # Runtime helpers used by LaunchpadSurface.
-import time
-
-from fl_stubs import channels, device
-import channel_lock as cl
-import led_display
-import modulators as ps
-from modulators import PadFader
-from constants import LP3_MENU_INACTIVE, PAD_DISABLED, LedColor
-from device_profile import DEVICE_FAMILY_LPM3, DEVICE_FAMILY_LPX
 
 LPX_CUSTOM_MODE_PRODUCT_ID = 0x0C
 LPM3_CUSTOM_MODE_PRODUCT_ID = 0x0D
@@ -678,8 +681,15 @@ def handle_pad(surface, event, pad: int, velocity: int, pressed: bool) -> bool:
     cp = mode.pad(pad)
     if cp is None or cp.is_off:
         return True
-    if cp.is_note and cl.is_locked(surface.state, surface._lock_context()):
-        return handle_locked_note(surface, pad, cp, velocity, pressed)
+    # Explicit routes take precedence over the normal custom-mode MIDI event
+    # path even when the page has not been channel-locked.  A routing set is
+    # deliberately independent of a lock: it is how one custom page fans out
+    # to several channels.
+    if cp.is_note and (
+        cl.is_locked(surface.state, surface._lock_context())
+        or cl.has_routes(surface.state, surface._lock_context())
+    ):
+        return handle_routed_note(surface, pad, cp, velocity, pressed)
     channel = cp.resolved_channel(int(surface.state.get("midi_channel", 0))) & 0x0F
     if cp.is_note:
         if pressed:
@@ -706,19 +716,30 @@ def handle_pad(surface, event, pad: int, velocity: int, pressed: bool) -> bool:
     return False
 
 
-def handle_locked_note(surface, pad: int, cp, velocity: int, pressed: bool) -> bool:
+def handle_routed_note(surface, pad: int, cp, velocity: int, pressed: bool) -> bool:
     midi_channel = int(surface.state["midi_channel"]) & 0x0F
     note = cp.control_value
     if pressed:
-        target = cl.get(surface.state, surface._lock_context())
         vel = max(1, velocity or cp.on_value or 100)
-        surface.active_pads[pad] = (target, note)
-        key = (target, note)
-        surface.active_notes[key] = surface.active_notes.get(key, 0) + 1
-        channels.midiNoteOn(target, note, vel, midi_channel)
+        # Fan out to the slot's routing set when one is configured; otherwise
+        # this collapses to the single locked channel it always used.
+        targets = surface._route_targets(cl.get(surface.state, surface._lock_context()))
+        if not targets:
+            targets = [cl.get(surface.state, surface._lock_context())]
+        surface.active_pads[pad] = (targets[0], note)
+        surface._pad_routed_notes[pad] = [(target, note) for target in targets]
+        for target in targets:
+            key = (target, note)
+            surface.active_notes[key] = surface.active_notes.get(key, 0) + 1
+            channels.midiNoteOn(target, note, vel, midi_channel)
     else:
         info = surface.active_pads.pop(pad, None)
-        if info is not None:
+        routed = surface._pad_routed_notes.pop(pad, None)
+        if routed:
+            for target, routed_note in routed:
+                surface._drop_active_note(target, routed_note)
+                channels.midiNoteOn(target, routed_note, 0, midi_channel)
+        elif info is not None:
             target, note = info
             surface._drop_active_note(target, note)
             channels.midiNoteOn(target, note, 0, midi_channel)

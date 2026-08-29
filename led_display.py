@@ -20,6 +20,11 @@ from constants import (
     LP3_SYSEX_SCROLL,
     LP3_SCROLL_SPEED,
     SYSEX_LAYOUT,
+    LPP_SYSEX_MODE_SELECT,
+    LPP_SYSEX_LAYOUT_SELECT,
+    LPP_MODE_ABLETON,
+    LPP_MODE_STANDALONE,
+    LPP_LAYOUT_PROGRAMMER,
     SESSION_CHANNEL,
     USER2_FALLBACK_CHANNELS,
     SETTINGS_GRID_PADS,
@@ -70,6 +75,14 @@ def configure_surface(
     _config["color_saturation"] = max(0.0, float(color_saturation))
     _config["color_gamma"] = max(0.01, float(color_gamma))
 
+def set_top_ccs(top_ccs) -> None:
+    """Widen the set of CCs treated as mode buttons after initial setup.
+
+    Used by device_profile to fold in extra dedicated buttons (e.g. the Pro's
+    bottom-row CCs) once the base profile has already been configured.
+    """
+    _config["top_ccs"] = tuple(int(value) for value in top_ccs)
+
 def rgb_max_value() -> int:
     return 127 if _config["mode"] == "lp3" else 63
 
@@ -114,10 +127,22 @@ def _lp3_colorspec(pad: int, palette_color: int, rgb_color: tuple[int, int, int]
 
 def set_layout(layout: int) -> None:
     """Send a layout-switch sysex to the hardware."""
+    prefix = list(_config["sysex_prefix"])
     if _config["mode"] == "lp3":
-        data = list(_config["sysex_prefix"]) + [_config["lp3_programmer_toggle"], layout, 0xF7]
+        data = prefix + [_config["lp3_programmer_toggle"], layout, 0xF7]
+    elif _config["mode"] == "lpp":
+        # LPP has no single-message toggle like MK2/LP3: Standalone mode must
+        # be selected before the Programmer layout can be chosen, so this is
+        # two SysEx messages instead of one. A falsy *layout* (the "restore"
+        # value passed on deinit) just drops back to Ableton mode instead,
+        # handing the surface back to its native behaviour.
+        if layout:
+            device.midiOutSysex(_sysex_bytes(prefix + [LPP_SYSEX_MODE_SELECT, LPP_MODE_STANDALONE, 0xF7]))
+            data = prefix + [LPP_SYSEX_LAYOUT_SELECT, LPP_LAYOUT_PROGRAMMER, 0xF7]
+        else:
+            data = prefix + [LPP_SYSEX_MODE_SELECT, LPP_MODE_ABLETON, 0xF7]
     else:
-        data = list(_config["sysex_prefix"]) + [SYSEX_LAYOUT, layout, 0xF7]
+        data = prefix + [SYSEX_LAYOUT, layout, 0xF7]
     device.midiOutSysex(_sysex_bytes(data))
 
 def supports_text_scroll() -> bool:
@@ -128,7 +153,7 @@ def supports_text_scroll() -> bool:
     """
     return _config["mode"] != "mk1"
 
-def scroll_text(text: str, color: int = 0, *, loop: bool = False) -> None:
+def scroll_text(text: str, color: int = 0, *, loop: bool = False, speed: int | None = None) -> None:
     """Scroll ASCII *text* across the pads using the native scroll SysEx.
 
     The two device families speak different scroll dialects:
@@ -137,8 +162,15 @@ def scroll_text(text: str, color: int = 0, *, loop: bool = False) -> None:
             where <colourspec> = 00h <palette>                    (LPX PRM p.23)
     *color* is a palette index in both cases.  When *loop* is False the
     hardware plays the text once and then restores the LEDs on its own.
-    Non-ASCII bytes and the reserved speed codes (1-7) are dropped so they
-    can't corrupt the stream / change scroll speed mid-text.
+    Non-ASCII bytes are dropped so they can't corrupt the stream.
+
+    *speed* is optional and native to each dialect, not a fabricated effect:
+    MK3 has a dedicated pads/second byte (0-127); MK2/LPP instead recognise a
+    raw byte 1-7 placed right before the text as a one-shot speed command (1
+    slowest, 7 fastest, default 4 — PRM "Text scrolling"), which is why the
+    reserved 1-7 range is excluded from the ASCII-filtered payload above:
+    it's only ever sent here, as a deliberate leading byte, never smuggled in
+    via arbitrary text. Omit *speed* to keep each family's native default.
     """
     if not supports_text_scroll():
         return
@@ -148,14 +180,16 @@ def scroll_text(text: str, color: int = 0, *, loop: bool = False) -> None:
     loop_byte = 0x01 if loop else 0x00
     if _config["mode"] == "lp3":
         # MK3: loop, speed, then a palette colourspec (type 0 + index).
+        scroll_speed = LP3_SCROLL_SPEED if speed is None else max(0, min(0x7F, int(speed)))
         data = prefix + [
             LP3_SYSEX_SCROLL,
             loop_byte,
-            LP3_SCROLL_SPEED,
+            scroll_speed,
             0x00, color,
         ] + payload + [0xF7]
     else:
-        data = prefix + [SYSEX_SCROLL, color, loop_byte] + payload + [0xF7]
+        speed_prefix = [max(1, min(7, int(speed)))] if speed is not None else []
+        data = prefix + [SYSEX_SCROLL, color, loop_byte] + speed_prefix + payload + [0xF7]
     device.midiOutSysex(_sysex_bytes(data))
 
 def stop_scroll() -> None:
@@ -376,7 +410,14 @@ def refresh_surface(
             continue
         color = led.index
         if _config["mode"] == "lp3":
-            pairs.extend(_lp3_colorspec(cc, color, None))
+            entry = _lp3_colorspec(cc, color, led.rgb)
+            if led.rgb is None:
+                pairs.extend(entry)
+            else:
+                rgb_entries.extend(entry)
+        elif led.rgb is not None:
+            red, green, blue = led.rgb
+            rgb_entries.extend((cc, red, green, blue))
         else:
             pairs.extend((cc, color))
     if _config["mode"] == "mk1":
