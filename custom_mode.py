@@ -475,8 +475,24 @@ def load_live_then_static(script_dir: Path, live_slots: set[int] | None = None) 
 
 LPX_CUSTOM_MODE_PRODUCT_ID = 0x0C
 LPM3_CUSTOM_MODE_PRODUCT_ID = 0x0D
-LPX_CUSTOM_MODE_SLOT_IDS = (4, 5, 6, 7, 8, 9, 10, 11)
-LPM3_CUSTOM_MODE_LAYOUT_IDS = (4, 5, 6, 7, 8, 9, 10, 11)
+# First slot id in each family's custom-mode read command — the id that means
+# "custom mode 1", and so maps to our slot 0 / slot_01.syx.
+#
+# The two families do NOT share a base, which is the whole reason this is a
+# constant rather than a literal 4. Launchpad X numbers from 4, matching its
+# layout-select ids (LPX PRM p.7: 04h..07h are Custom 1-4) — confirmed against
+# real captures, whose replies carry 04h/05h/06h/07h for slots 1-4. The Mini
+# MK3 numbers its read command from 5 even though its layout-select ids also
+# start at 04h (Mini PRM p.7: 04h..06h are Custom 1-3), so assuming a shared
+# base of 4 shifted every Mini mode down one and loaded its three stock custom
+# modes as slot_02/03/04 with slot_01 left empty.
+LPX_CUSTOM_MODE_BASE_SLOT_ID = 4
+LPM3_CUSTOM_MODE_BASE_SLOT_ID = 5
+# How many consecutive ids to request per family. Novation's own firmware has
+# 4 custom modes on the X and 3 on the Mini, but modded Mini firmware extends
+# the set, so the request sweep is deliberately wider than stock: unanswered
+# ids simply never reply, which costs nothing but the request.
+CUSTOM_MODE_SLOT_COUNT = 8
 CUSTOM_MODE_READ_TIMEOUT_SECONDS = 1.5
 CUSTOM_FADER_MICRO_BRIGHTNESS = (0.25, 0.5, 0.75, 1.0)
 
@@ -534,12 +550,19 @@ def product_id(device_family: str) -> int | None:
     return None
 
 
-def slot_ids(device_family: str) -> tuple[int, ...]:
+def base_slot_id(device_family: str) -> int | None:
     if device_family == DEVICE_FAMILY_LPX:
-        return LPX_CUSTOM_MODE_SLOT_IDS
+        return LPX_CUSTOM_MODE_BASE_SLOT_ID
     if device_family == DEVICE_FAMILY_LPM3:
-        return LPM3_CUSTOM_MODE_LAYOUT_IDS
-    return ()
+        return LPM3_CUSTOM_MODE_BASE_SLOT_ID
+    return None
+
+
+def slot_ids(device_family: str) -> tuple[int, ...]:
+    base = base_slot_id(device_family)
+    if base is None:
+        return ()
+    return tuple(base + offset for offset in range(CUSTOM_MODE_SLOT_COUNT))
 
 
 def read_request(device_family: str, slot_id: int) -> bytes | None:
@@ -570,7 +593,12 @@ def start_live_read(surface, log) -> None:
             device.midiOutSysex(request)
         except Exception as exc:
             log(f"custom mode slot id {slot_id} read request failed: {exc}")
-    log(f"requested {len(ids)} on-device custom mode slot id(s) from {surface.device_label}")
+    log(
+        f"requested {len(ids)} on-device custom mode slot id(s) "
+        f"{ids[0]}-{ids[-1]} from {surface.device_label} "
+        f"(id {ids[0]} = slot 1). If the modes land one slot off, this base is "
+        f"the thing to correct."
+    )
 
 
 def complete_live_read_if_due(surface, log) -> None:
@@ -622,8 +650,8 @@ def event_sysex_bytes(event) -> bytes:
 
 def reply_slot(device_family: str, sysex: bytes) -> tuple[int, int] | None:
     pid = product_id(device_family)
-    ids = slot_ids(device_family)
-    if pid is None or not ids or len(sysex) < 12:
+    base = base_slot_id(device_family)
+    if pid is None or base is None or len(sysex) < 12:
         return None
     if sysex[0] != 0xF0 or sysex[-1] != 0xF7:
         return None
@@ -637,9 +665,8 @@ def reply_slot(device_family: str, sysex: bytes) -> tuple[int, int] | None:
         if sysex[9] != 0x40:
             return None
         slot_id = sysex[10] & 0x7F
-    try:
-        slot = ids.index(slot_id)
-    except ValueError:
+    slot = slot_id - base
+    if not 0 <= slot < CUSTOM_MODE_SLOT_COUNT:
         return None
     return slot, slot_id
 

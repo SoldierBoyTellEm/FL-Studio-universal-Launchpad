@@ -175,6 +175,24 @@ SYSEX_SCROLL    = 0x14
 LP3_SYSEX_SCROLL = 0x07
 # Default MK3 scroll speed in pads/second (MK2 has no speed byte).
 LP3_SCROLL_SPEED = 0x07
+# MK3 DAW-mode enable (10h). The standby escape turns this on for one reason
+# only: it is what lights the hardware Session button and makes it pressable
+# (LPX PRM p.16). The Session/Fader layouts it also unlocks live on the
+# device's separate DAW interface, which this script never speaks to.
+LP3_SYSEX_DAW_MODE = 0x10
+LP3_DAW_MODE_OFF = 0x00
+LP3_DAW_MODE_ON  = 0x01
+# MK3 layout select (00h). Sent data-less it is a *readback* request, and the
+# reply arrives on the interface it was sent from — this script's. That makes
+# the layout the user selected on the device observable here even for buttons
+# whose own CC goes to the DAW interface, which is how standby notices the
+# Session press that ends it. Layout 00h is Session (selectable only in DAW
+# mode, hence the pairing with LP3_SYSEX_DAW_MODE above).
+LP3_SYSEX_LAYOUT_SELECT = 0x00
+LP3_LAYOUT_SESSION = 0x00
+# How often standby polls the layout readback, in seconds. Fast enough that
+# the Session press feels instant, slow enough to stay off the MIDI bus.
+LP3_STANDBY_POLL_SECONDS = 0.15
 # Launchpad Pro (original) Standalone-mode SysEx opcodes. Unlike MK2's single
 # SYSEX_LAYOUT toggle, LPP needs two separate messages: first force Standalone
 # mode (it can otherwise be sitting in Ableton/Live mode), then select the
@@ -191,6 +209,12 @@ LPP_LAYOUT_PROGRAMMER = 0x03
 # Palette colour for the "FPC" placeholder scroll. MUST be non-zero —
 # scroll colour 0 is "off", which scrolls the text invisibly. 0x03 is white.
 FPC_SCROLL_COLOR = 0x03
+# "Brisk" scroll speed for the FPC placeholder, MK3 dialect. MK2/LPP's speed
+# byte is a capped 1-7 level (7 = fastest), while MK3's is literal
+# pads/second — reusing MK2's "7" on MK3 barely nudges it past
+# LP3_SCROLL_SPEED's own default (also 7), reading as far too slow instead of
+# brisk. 20 pads/second gives MK3 a comparably snappy scroll.
+FPC_SCROLL_SPEED_LP3 = 20
 SYSEX_LAYOUT    = 0x22
 # Top-row CC numbers
 TOP_CC_START    = 104

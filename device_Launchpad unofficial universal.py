@@ -86,6 +86,9 @@ from constants import (
     LP3_ARROW_PAN_ACTIVE,
     LP3_ARROW_INACTIVE,
     FPC_SCROLL_COLOR,
+    FPC_SCROLL_SPEED_LP3,
+    LP3_LAYOUT_SESSION,
+    LP3_STANDBY_POLL_SECONDS,
     STATE_FILE,
     DEFAULT_STATE,
     SIDE_COLUMN_PADS,
@@ -112,6 +115,7 @@ DEVICE_FAMILY_LPP3 = dp.DEVICE_FAMILY_LPP3
 # of these membership tests behind.
 PROGRAMMER_MODE_FAMILIES = dp.PROGRAMMER_MODE_FAMILIES
 SOFTWARE_PULSE_FAMILIES = dp.SOFTWARE_PULSE_FAMILIES
+MK3_PROTOCOL_FAMILIES = dp.MK3_PROTOCOL_FAMILIES
 LP3_PROGRAMMER_MODE = dp.LP3_PROGRAMMER_MODE
 LP3_LIVE_MODE = dp.LP3_LIVE_MODE
 
@@ -210,6 +214,26 @@ class LaunchpadSurface:
         self._xy_up_held: bool = False
         self._xy_down_held: bool = False
         self._xy_combo_fired: bool = False
+        # Standby ("escape") state, MK3 protocol family only. All four arrows
+        # held at once hands the surface back to FL: every pad and button
+        # passes through unhandled, the grid goes dark, and only the Session
+        # key stays lit as the way back in. RAM-only — a script reload or a
+        # new FL session always comes up attached.
+        self._standby: bool = False
+        self._arrows_held: set[int] = set()
+        # Set while the arrows that triggered the chord are still down, so
+        # their releases don't fire octave/pan actions on the way out.
+        self._standby_chord_fired: bool = False
+        # Set between the Session press that leaves standby and its release,
+        # so the release is absorbed instead of cycling the restored mode.
+        self._standby_exit_pending: bool = False
+        # Counts down while released, logging the first raw events Live mode
+        # sends us (see _handle_standby_input).
+        self._standby_input_probe_remaining: int = 0
+        # Layout-readback poll while released: when to send the next request,
+        # and the last layout the device reported (None until the first reply).
+        self._standby_next_poll: float = 0.0
+        self._standby_last_layout: int | None = None
         self.performance_direct_pads: dict[int, tuple[int, int]] = {}
         self._fpc_active_pad_order: list[int] = []
         # FPC slot recovery (RAM-only): last-known global channel name per slot,
@@ -436,15 +460,181 @@ class LaunchpadSurface:
         slot data, so a stale assignment left pointing at a deleted/non-FPC
         channel (e.g. after a channel-rack edit outran the recovery pass)
         would still count as "mapped" and wrongly suppress the placeholder.
-        speed=9 asks for a brisker scroll than each dialect's own default
-        (MK3's pads/second unit; MK2/LPP's native 1-7 scale, capped at 7).
+        Requests a brisker-than-default scroll in each dialect's own units:
+        MK2/LPP's native 1-7 scale, capped at 7 (its fastest); MK3's literal
+        pads/second (FPC_SCROLL_SPEED_LP3). A single raw number doesn't work
+        for both — e.g. 9 clamps to MK2's max (7) but is barely past MK3's
+        own default of 7 pps, which read as far too slow on LPX/Mini MK3.
         """
         if (
             led_display.supports_text_scroll()
             and not fm.has_any_valid_fpc_slot_assignment(self.state)
         ):
-            led_display.scroll_text("FPC", FPC_SCROLL_COLOR, speed=9)
+            speed = FPC_SCROLL_SPEED_LP3 if led_display.surface_mode() == "lp3" else 7
+            led_display.scroll_text("FPC", FPC_SCROLL_COLOR, speed=speed)
             self._fpc_scroll_active = True
+
+    # --- Standby / escape (MK3 protocol family only) -----------------------
+    # The four arrows held together drop the device back to Live mode (the 0Eh
+    # toggle), handing it to its own firmware: Note mode, the Custom modes and
+    # the stock top row all work again, and this script stops acting on
+    # anything it sends. Pressing Session returns it to our Programmer layout.
+    #
+    # Getting the Session press back is the tricky half, and needs two things
+    # the MK3 references spell out separately:
+    #
+    #   1. DAW mode (10h) is enabled on the way out. That is purely for its
+    #      effect on the hardware button — "when DAW mode is enabled, the
+    #      Session button will light and become available to press" (LPX PRM
+    #      p.16). Without it Session is dark and inert in Live mode.
+    #   2. Session's own CC goes to the device's *DAW* interface (p.18), which
+    #      this script is not bound to — so the press is never delivered here.
+    #      What is delivered here is any SysEx *readback* reply, because those
+    #      come back on the interface the request was sent from (p.6). So while
+    #      released we poll the data-less layout-select readback (00h), and
+    #      when the device answers "Session" (layout 00h, which p.7 notes is
+    #      only selectable in DAW mode) we know Session was pressed.
+    #
+    # The four-arrow chord also still returns, as a fallback that depends on no
+    # firmware behaviour beyond the arrows sending CC.
+    def _standby_available(self) -> bool:
+        return self.device_family in MK3_PROTOCOL_FAMILIES
+
+    def _arrow_ccs(self) -> tuple[int, ...]:
+        return (
+            self._top_octave_up, self._top_octave_down,
+            self._top_pan_left, self._top_pan_right,
+        )
+
+    def _handle_standby_chord(self, cc: int, pressed: bool) -> bool:
+        """Track the four-arrow chord. Returns True if the event was consumed
+        (chord fired, or a release belonging to a chord that already fired)."""
+        if not self._standby_available() or cc not in self._arrow_ccs():
+            return False
+        if pressed:
+            self._arrows_held.add(cc)
+            if len(self._arrows_held) < 4:
+                return False  # not the full chord yet — normal arrow handling
+            self._standby_chord_fired = True
+            self._enter_standby()
+            return True
+        self._arrows_held.discard(cc)
+        # Absorb the releases of a chord that fired, so the arrows don't also
+        # octave/pan on the way out. Clears once the last one is up.
+        if self._standby_chord_fired:
+            if not self._arrows_held:
+                self._standby_chord_fired = False
+            return True
+        return False
+
+    def _handle_standby_input(self, event, status: int) -> bool:
+        """Raw input while released to Live mode. Watches for the four-arrow
+        chord as a second way back, and logs the first few events so the device
+        log records what this hardware actually sends in Live mode. Returns
+        True only if the event was consumed (chord completed)."""
+        if self._standby_input_probe_remaining > 0:
+            self._standby_input_probe_remaining -= 1
+            _log(
+                f"standby input probe: status={event.status:#04x} "
+                f"data1={event.data1} data2={event.data2}"
+            )
+        if status != midi.MIDI_CONTROLCHANGE or event.data1 not in self._arrow_ccs():
+            return False
+        if event.data2 > 0:
+            self._arrows_held.add(event.data1)
+            if len(self._arrows_held) < 4:
+                # Let the partial chord through — in Live mode the arrows are
+                # the firmware's own transpose/scroll controls, and swallowing
+                # them would break the layout the user came here to use.
+                return False
+            self._exit_standby("four arrows")
+            return True
+        self._arrows_held.discard(event.data1)
+        return False
+
+    def _enter_standby(self) -> None:
+        _log(
+            "standby: released to Live mode (four-arrow escape); "
+            "press Session — or the four arrows again — to return"
+        )
+        self._stop_fpc_scroll()
+        self._release_all_notes()
+        if self._routing_page_visible:
+            self._routing_page_visible = False
+        self._save_state()
+        self._standby = True
+        # Flush the LED caches (on MK3 this is all clear_surface does — the
+        # firmware repaints the whole surface itself on the way into Live mode,
+        # so there is nothing to blank first) so nothing is assumed still lit.
+        led_display.clear_surface(self._grid_led_cache, self._top_led_cache)
+        # Order matters: Live mode lands on "Session layout, or Note mode when
+        # not in DAW mode" (LPX PRM p.8). Switching first, while DAW mode is
+        # still off, puts the device on Note mode — the firmware layout the
+        # escape exists to expose, and a baseline the later Session press is a
+        # visible transition away from. Enabling DAW mode after only lights the
+        # Session key; it doesn't move the layout again.
+        led_display.set_layout(LP3_LIVE_MODE)
+        led_display.set_daw_mode(True)
+        # Forces _apply_surface_layout to resend the Programmer toggle on the
+        # way back in, instead of assuming the cached layout still holds.
+        self._active_layout = LP3_LIVE_MODE
+        self._standby_input_probe_remaining = 16
+        # Poll immediately, then on the interval; also re-baseline the layout so
+        # the reply that merely confirms Live mode isn't read as a Session press.
+        self._standby_next_poll = 0.0
+        self._standby_last_layout = None
+        # Input passes through untouched from here, so the arrow releases that
+        # end the chord will never reach _handle_standby_chord. Drop the held
+        # set now rather than leaving it full — a stale 4 would re-fire the
+        # chord on the first arrow pressed after the surface is reclaimed.
+        self._arrows_held.clear()
+        self._standby_chord_fired = False
+        # Same for the up/down combo trackers, whose releases are also lost.
+        self._xy_up_held = False
+        self._xy_down_held = False
+        self._xy_combo_fired = False
+        self._refresh_needed = False
+
+    def _poll_standby_layout(self, now: float) -> None:
+        """While released, ask the device which layout it is showing. The reply
+        lands in on_sysex -> _handle_standby_layout_reply."""
+        if now < self._standby_next_poll:
+            return
+        self._standby_next_poll = now + LP3_STANDBY_POLL_SECONDS
+        led_display.request_layout_readback()
+
+    def _handle_standby_layout_reply(self, sysex: bytes) -> bool:
+        """Returns True if *sysex* was a layout readback reply (consumed)."""
+        layout = led_display.parse_layout_readback(sysex)
+        if layout is None:
+            return False
+        previous, self._standby_last_layout = self._standby_last_layout, layout
+        # Only a *transition* into Session counts. The first reply just
+        # establishes the baseline, and repeats of it are the idle case.
+        if layout == LP3_LAYOUT_SESSION and previous not in (None, LP3_LAYOUT_SESSION):
+            self._exit_standby("Session")
+        return True
+
+    def _exit_standby(self, trigger: str) -> None:
+        _log(f"standby: reclaimed to Programmer mode ({trigger})")
+        self._standby = False
+        self._standby_input_probe_remaining = 0
+        self._standby_last_layout = None
+        # DAW mode was only ever on to light the Session key; the PRM asks that
+        # it be turned off again so the device is left clean for standalone use.
+        led_display.set_daw_mode(False)
+        # Arrows pressed during standby are tracked by the raw-input path, not
+        # the normal one; start clean either way.
+        self._arrows_held.clear()
+        self._standby_chord_fired = False
+        # Resends the Programmer toggle (_active_layout was pinned to Live on
+        # the way out) and clears the caches, so the repaint below is a full
+        # one over whatever the firmware left on the surface.
+        self._apply_surface_layout()
+        self._grid_led_cache.clear()
+        self._top_led_cache.clear()
+        self._refresh_surface()
+        self._refresh_needed = False
 
     def _begin_mode_switch(self, mode) -> None:
         # Any pending placeholder scroll belongs to the mode we're leaving.
@@ -548,6 +738,11 @@ class LaunchpadSurface:
     def on_deinit(self) -> None:
         self._save_state()
         self._release_all_notes()
+        if self._standby:
+            # Leave the device standalone-clean rather than in the DAW mode
+            # standby borrowed to light the Session key.
+            self._standby = False
+            led_display.set_daw_mode(False)
         if self._fpc_scroll_active:
             self._fpc_scroll_active = False
             led_display.stop_scroll()
@@ -561,6 +756,12 @@ class LaunchpadSurface:
         else:
             self._active_layout = None
     def on_idle(self) -> None:
+        if self._standby:
+            # Released to the firmware: the only thing left to do is watch for
+            # the Session press that ends it. Everything below drives a surface
+            # we don't own right now.
+            self._poll_standby_layout(time.monotonic())
+            return
         selected = self._selected_channel()
         if selected != self._last_selected_channel:
             self._last_selected_channel = selected
@@ -713,6 +914,12 @@ class LaunchpadSurface:
     def _prepare_custom_modes(self) -> None:
         cm.prepare_runtime(self, _log)
     def on_sysex(self, event) -> None:
+        # Standby's layout-readback replies share the custom-mode SysEx prefix,
+        # so they're claimed here before cm gets a chance to misread one.
+        if self._standby and self._handle_standby_layout_reply(
+            cm.event_sysex_bytes(event)
+        ):
+            return
         cm.handle_sysex(self, event, _log)
     def on_update_live_mode(self, _last_track: int) -> None:
         if pm.performance_available():
@@ -783,6 +990,31 @@ class LaunchpadSurface:
 
     def on_midi_msg(self, event) -> None:
         status = event.status & 0xF0
+        if (
+            (self._standby or self._standby_exit_pending)
+            and status == midi.MIDI_CONTROLCHANGE
+            and event.data1 == self._top_performance
+        ):
+            # Session is the documented way out. Both halves of the press are
+            # consumed here: letting the release fall through would reach
+            # _handle_performance_button and immediately cycle the surface mode
+            # we just came back to.
+            if event.data2 > 0:
+                if self._standby:
+                    self._standby_exit_pending = True
+                    self._exit_standby("Session")
+            else:
+                self._standby_exit_pending = False
+            event.handled = True
+            return
+        if self._standby:
+            if self._handle_standby_input(event, status):
+                event.handled = True
+                return
+            # Everything else passes straight through to FL (handled=False), so
+            # the device's own Live-mode layouts play into FL as normal MIDI.
+            event.handled = False
+            return
         if status == midi.MIDI_NOTEON:
             pressed = event.data2 > 0
             if event.data1 in self._note_input_pads() or fm.is_fpc_selector(event.data1):
@@ -985,6 +1217,11 @@ class LaunchpadSurface:
         return True
     # Top-row button routing
     def _handle_top_button(self, cc: int, pressed: bool, event) -> None:
+        # The four-arrow escape outranks every other arrow behaviour (including
+        # the routing overlay's, which claims the arrows outright), so it stays
+        # reachable from any surface.
+        if self._handle_standby_chord(cc, pressed):
+            return
         if pressed:
             _log(f"top button cc={cc} action={self._top_button_action_name(cc)}")
         shortcut_slot = self._view_shortcut_ccs.get(cc)
@@ -1081,7 +1318,14 @@ class LaunchpadSurface:
     # Octave/pan arrows: one vertical and one horizontal action per mode.
     def _handle_arrow_press(self, cc: int) -> None:
         if cc in (self._top_octave_down, self._top_octave_up):
-            if self.surface_mode == MODE_STEP_SEQ:
+            # The vertical arrows carry two different polarities, because the
+            # two things they drive count in opposite directions:
+            #   list navigation (performance tracks, step-sequencer channels)
+            #     walks a top-to-bottom list, so *down* is +1;
+            #   pitch (note mode's octave) rises, so *up* is +1.
+            # Performance mode used to fall through to the pitch polarity,
+            # which scrolled its track window the wrong way on every device.
+            if self.surface_mode in (MODE_STEP_SEQ, MODE_PERFORMANCE):
                 self._step_arrow_vertical(1 if cc == self._top_octave_down else -1)
             else:
                 self._step_arrow_vertical(1 if cc == self._top_octave_up else -1)
@@ -1091,7 +1335,9 @@ class LaunchpadSurface:
     def _step_arrow_vertical(self, direction: int) -> None:
         if self.surface_mode == MODE_PERFORMANCE:
             if pm.performance_available():
-                pm.step_tracks(direction, self.state)  # up = scroll up
+                # +1 walks down the track list; _handle_arrow_press maps the
+                # Down arrow to +1 for this mode.
+                pm.step_tracks(direction, self.state)
                 self._sync_performance_view()
             else:
                 ss.step_channels(direction, self.state)
@@ -1885,6 +2131,12 @@ class LaunchpadSurface:
         return po.gross_beat_slot_mode(self)
     # LED rendering
     def _refresh_surface(self) -> None:
+        # The device owns its own surface while released to Live mode; painting
+        # would draw our LEDs over the firmware layout the escape exists to
+        # expose. Guarded here rather than per-caller so every path that
+        # repaints (on_refresh, project load, mode restore) is covered.
+        if self._standby:
+            return
         # Note-key pulse when Note mode is channel-locked.
         lights_out = self._lights_effectively_out()
         note_lock_pulse = (
@@ -1952,7 +2204,7 @@ class LaunchpadSurface:
     def _grid_lighting(self, pad: int) -> LedColor:
         """Grid pad color: global overlays (lights-out, settings pane) first,
         then the active mode's lighting via _grid_lighting_for_mode."""
-        if self._lights_effectively_out():
+        if self._standby or self._lights_effectively_out():
             return LedColor(PAD_DISABLED)
         if self._routing_page_visible and self._routing_page_available():
             return self._routing_page_lighting(pad)
@@ -2140,6 +2392,11 @@ class LaunchpadSurface:
     def _top_color(self, cc: int) -> int:
         # Returns a bare palette index; refresh_surface normalises it to a
         # LedColor (top CCs don't yet set explicit MK1 values).
+        if self._standby:
+            # Not normally reached — on_refresh doesn't paint while released —
+            # but keeps any direct caller (tests, a stray refresh) from drawing
+            # the suspended mode over the firmware's own layout.
+            return PAD_DISABLED
         if self._lights_effectively_out():
             return PAD_DISABLED
         shortcut_slot = self._view_shortcut_ccs.get(cc)
@@ -2174,8 +2431,10 @@ class LaunchpadSurface:
                         ss.remaining_channel_steps(1, self.state),
                         LP3_ARROW_OCTAVE_ACTIVE,
                     )
+                # Down walks toward the end of the track list (+1), matching
+                # the step-sequencer branch above and what the button does.
                 return pm.performance_arrow_color(
-                    pm.remaining_track_steps(-1, self.state, self.surface_mode),
+                    pm.remaining_track_steps(1, self.state, self.surface_mode),
                     self.surface_mode,
                 )
             if self.surface_mode == MODE_NOTE:
@@ -2201,8 +2460,9 @@ class LaunchpadSurface:
                         ss.remaining_channel_steps(-1, self.state),
                         LP3_ARROW_OCTAVE_ACTIVE,
                     )
+                # Up walks back toward the start of the track list (-1).
                 return pm.performance_arrow_color(
-                    pm.remaining_track_steps(1, self.state, self.surface_mode),
+                    pm.remaining_track_steps(-1, self.state, self.surface_mode),
                     self.surface_mode,
                 )
             if self.surface_mode == MODE_NOTE:
@@ -2434,6 +2694,12 @@ class LaunchpadSurface:
             return SIDE_COLUMN_PADS
         return ()
     def _apply_surface_layout(self) -> None:
+        # Never claw the device back out of Live mode on our own initiative —
+        # only _exit_standby does that, after clearing the flag. Otherwise a
+        # mode restore (project load, FPC recovery) would end the escape
+        # without the user asking.
+        if self._standby:
+            return
         if self.device_family in PROGRAMMER_MODE_FAMILIES:
             layout = LP3_PROGRAMMER_MODE
             # LPP reaches Programmer via a two-message Standalone+layout
